@@ -34,8 +34,7 @@ DAILY_LOSS_MAX = 0.10   # stop si -10% dans la journée
 
 # Binance
 BINANCE_KLINES = "https://api.binance.com/api/v3/klines"
-BINANCE_PRICE  = "https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd"
-
+COINGECKO_PRICE = "https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd"
 
 # Polymarket CLOB (lecture seule pour l'instant)
 POLY_MARKETS   = "https://clob.polymarket.com/markets"
@@ -140,12 +139,12 @@ def compute_signal(candles_1m, candles_5m, candles_15m):
         "reasons": [], "indicators": {}, "tf_bias": {}
     }
 
-    if len(candles_5m) < 30:
-        result["reasons"].append("⏳ Pas assez de données (besoin 30 bougies 5m)")
+    if len(candles_5m) < 14:
+        result["reasons"].append("⏳ Pas assez de données (besoin 14 bougies 5m)")
         return result
 
     def analyze_tf(candles, label):
-        if len(candles) < 20:
+        if len(candles) < 10:
             return 0, []
         closes = [c["close"] for c in candles]
         highs  = [c["high"]  for c in candles]
@@ -379,13 +378,23 @@ async def fetch_klines(interval, limit=50):
         return []
 
 async def fetch_price():
+    # Try CoinGecko first (works everywhere)
     try:
         async with aiohttp.ClientSession() as session:
-            async with session.get(BINANCE_PRICE, timeout=aiohttp.ClientTimeout(total=5)) as r:
+            async with session.get(COINGECKO_PRICE, timeout=aiohttp.ClientTimeout(total=8)) as r:
+                data = await r.json()
+                return float(data["bitcoin"]["usd"])
+    except Exception as e:
+        log.error(f"CoinGecko price error: {e}")
+    # Fallback: Binance
+    try:
+        async with aiohttp.ClientSession() as session:
+            binance_url = "https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT"
+            async with session.get(binance_url, timeout=aiohttp.ClientTimeout(total=5)) as r:
                 data = await r.json()
                 return float(data["price"])
-    except Exception as e:
-        log.error(f"Binance price: {e}")
+    except Exception as e2:
+        log.error(f"Binance fallback error: {e2}")
         return st.current_price
 
 async def fetch_poly_markets():
