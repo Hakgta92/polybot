@@ -32,9 +32,11 @@ MAX_BET_PCT    = 0.05   # max 5% bankroll par trade
 POLY_FEE       = 0.02   # 2% fee Polymarket
 DAILY_LOSS_MAX = 0.10   # stop si -10% dans la journée
 
-# Binance
-BINANCE_KLINES = "https://api.binance.com/api/v3/klines"
+# Price APIs (multiple fallbacks)
+BINANCE_KLINES  = "https://api.binance.com/api/v3/klines"
+KRAKEN_PRICE    = "https://api.kraken.com/0/public/Ticker?pair=XBTUSD"
 COINGECKO_PRICE = "https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd"
+COINBASE_PRICE  = "https://api.coinbase.com/v2/prices/BTC-USD/spot"
 
 # Polymarket CLOB (lecture seule pour l'instant)
 POLY_MARKETS   = "https://clob.polymarket.com/markets"
@@ -357,45 +359,81 @@ st = State()
 
 # ─── BINANCE DATA ──────────────────────────────────────────────────────────
 async def fetch_klines(interval, limit=50):
+    # Try Binance first
     url = f"{BINANCE_KLINES}?symbol=BTCUSDT&interval={interval}&limit={limit}"
     try:
         async with aiohttp.ClientSession() as session:
             async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as r:
-                data = await r.json()
-                candles = []
-                for k in data:
-                    candles.append({
-                        "open":  float(k[1]),
-                        "high":  float(k[2]),
-                        "low":   float(k[3]),
-                        "close": float(k[4]),
-                        "vol":   float(k[5]),
-                        "ts":    int(k[0]) // 1000,
-                    })
-                return candles
+                if r.status == 200:
+                    data = await r.json()
+                    if isinstance(data, list) and len(data) > 0:
+                        candles = []
+                        for k in data:
+                            candles.append({
+                                "open":  float(k[1]),
+                                "high":  float(k[2]),
+                                "low":   float(k[3]),
+                                "close": float(k[4]),
+                                "vol":   float(k[5]),
+                                "ts":    int(k[0]) // 1000,
+                            })
+                        log.info(f"Klines {interval}: {len(candles)} candles from Binance")
+                        return candles
     except Exception as e:
-        log.error(f"Binance klines {interval}: {e}")
-        return []
+        log.warning(f"Binance klines {interval} failed: {e}")
+
+    # Fallback: Kraken OHLC
+    try:
+        kraken_interval_map = {"1m": 1, "5m": 5, "15m": 15, "1h": 60}
+        kr_interval = kraken_interval_map.get(interval, 5)
+        kr_url = f"https://api.kraken.com/0/public/OHLC?pair=XBTUSD&interval={kr_interval}&count={limit}"
+        async with aiohttp.ClientSession() as session:
+            async with session.get(kr_url, timeout=aiohttp.ClientTimeout(total=10)) as r:
+                if r.status == 200:
+                    data = await r.json()
+                    ohlc = data.get("result", {}).get("XXBTZUSD", [])
+                    if ohlc:
+                        candles = []
+                        for k in ohlc[-limit:]:
+                            candles.append({
+                                "open":  float(k[1]),
+                                "high":  float(k[2]),
+                                "low":   float(k[3]),
+                                "close": float(k[4]),
+                                "vol":   float(k[6]),
+                                "ts":    int(k[0]),
+                            })
+                        log.info(f"Klines {interval}: {len(candles)} candles from Kraken")
+                        return candles
+    except Exception as e2:
+        log.warning(f"Kraken klines {interval} failed: {e2}")
+
+    log.error(f"All klines sources failed for {interval}")
+    return []
 
 async def fetch_price():
-    # Try CoinGecko first (works everywhere)
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(COINGECKO_PRICE, timeout=aiohttp.ClientTimeout(total=8)) as r:
-                data = await r.json()
-                return float(data["bitcoin"]["usd"])
-    except Exception as e:
-        log.error(f"CoinGecko price error: {e}")
-    # Fallback: Binance
-    try:
-        async with aiohttp.ClientSession() as session:
-            binance_url = "https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT"
-            async with session.get(binance_url, timeout=aiohttp.ClientTimeout(total=5)) as r:
-                data = await r.json()
-                return float(data["price"])
-    except Exception as e2:
-        log.error(f"Binance fallback error: {e2}")
-        return st.current_price
+    """Try 4 sources in order until one works"""
+    sources = [
+        ("Kraken",   "https://api.kraken.com/0/public/Ticker?pair=XBTUSD",          lambda d: float(d["result"]["XXBTZUSD"]["c"][0])),
+        ("Coinbase", "https://api.coinbase.com/v2/prices/BTC-USD/spot",              lambda d: float(d["data"]["amount"])),
+        ("CoinGecko","https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd", lambda d: float(d["bitcoin"]["usd"])),
+        ("Binance",  "https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT",  lambda d: float(d["price"])),
+    ]
+    for name, url, parser in sources:
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, timeout=aiohttp.ClientTimeout(total=6)) as r:
+                    if r.status == 200:
+                        data = await r.json()
+                        price = parser(data)
+                        if price > 0:
+                            log.info(f"Price from {name}: ${price:,.2f}")
+                            return price
+        except Exception as e:
+            log.warning(f"{name} failed: {e}")
+            continue
+    log.error("All price sources failed")
+    return st.current_price
 
 async def fetch_poly_markets():
     """Récupère les marchés BTC UP/DOWN actifs sur Polymarket"""
