@@ -575,37 +575,44 @@ Bankroll: {bankroll:.2f} USDC
 ═══════════════════════════════
 RÈGLES DE DÉCISION
 ═══════════════════════════════
-OBJECTIF: Maximiser le win rate. Ne trader QUE les setups à haute probabilité.
+OBJECTIF: Maximiser le win rate. Suivre la tendance dominante.
+
+RÈGLE FONDAMENTALE — TENDANCE MACRO:
+BTC 24h change: {btc_24h['change_pct']:+.2f}%
+- Si BTC < -1% sur 24h → tendance BAISSIÈRE → INTERDIRE bets UP sauf signal EXCEPTIONNEL (RSI < 15 + divergence confirmée sur 1h)
+- Si BTC > +1% sur 24h → tendance HAUSSIÈRE → INTERDIRE bets DOWN sauf signal EXCEPTIONNEL (RSI > 85 + divergence confirmée)
+- Si BTC entre -1% et +1% → marché neutre → suivre les indicateurs normalement
+⚠️ UN RSI SURVENDU EN TENDANCE BAISSIÈRE NE SIGNIFIE PAS REBOND — ça peut rester survendu longtemps!
 
 STRATÉGIE HAUTE PROBABILITÉ:
 1. Signal FORT (trader avec mise normale):
-   - 3+ timeframes alignés dans la même direction
-   - RSI < 25 (UP) ou RSI > 75 (DOWN) sur le 5m
+   - 3+ timeframes alignés dans la même direction QUE LA TENDANCE MACRO
    - MACD confirme sur au moins 2 TF
-   - Volume ratio > 1.3 (confirmation institutionnelle)
+   - Volume ratio > 1.2
 
 2. Signal MOYEN (trader avec mise réduite 50%):
-   - 2 timeframes alignés + RSI < 35 ou > 65
-   - Rebond clair sur support/résistance avec confirmation
+   - 2 timeframes alignés dans la direction de la tendance
    - Session EXCELLENT ou GOOD uniquement
+   - RSI confirme (< 40 pour UP en tendance haussière, > 60 pour DOWN en tendance baissière)
 
 3. NE PAS TRADER si:
-   - Tous les TF contradictoires
-   - ATR < 0.05% (marché vraiment mort)
+   - Signal CONTRE la tendance macro sans confirmation exceptionnelle
+   - ATR < 0.05% (marché mort)
    - Prix exactement sur S/R sans direction claire
-   - 3 pertes consécutives sur le même setup (attendre changement)
+   - 3 pertes consécutives → pause 1 tick
 
 4. RÈGLES AVANCÉES:
-   - RSI divergence: RSI monte mais prix baisse → signal UP fort
-   - Après rebond RSI extrême (< 20) → chercher confirmation UP sur 1m
-   - Fear&Greed < 20: favoriser UP (marché survendu globalement)
-   - Fear&Greed > 80: favoriser DOWN (marché suracheté globalement)
-   - Session US_OPEN/US_AFTERNOON: augmenter confiance de 10%
+   - Fear&Greed < 15 EN TENDANCE NEUTRE → favoriser UP (rebond macro)
+   - Fear&Greed < 15 EN TENDANCE BAISSIÈRE → NE PAS aller UP (baisse peut continuer)
+   - Fear&Greed > 80 → favoriser DOWN
+   - Session US_OPEN/US_AFTERNOON → augmenter confiance 10%
+   - EMA 1h baissière = tendance forte → ne pas aller contre
 
 5. MISE:
-   - Signal FORT: {min(MAX_BET_USD, bankroll*MAX_BET_PCT):.2f}$ max
+   - Signal FORT dans tendance: {min(MAX_BET_USD, bankroll*MAX_BET_PCT):.2f}$ max
    - Signal MOYEN: {MIN_BET_USD + (min(MAX_BET_USD, bankroll*MAX_BET_PCT)-MIN_BET_USD)*0.5:.2f}$
    - Après 2 pertes: {MIN_BET_USD}$ minimum seulement
+   - Contre-tendance: {MIN_BET_USD}$ max même si signal fort
 
 RÉPONDS UNIQUEMENT EN JSON:
 {{
