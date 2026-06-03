@@ -1,8 +1,6 @@
 """
-POLYMARKET BTC BOT v10.3
-FIX: Balance via get_balance_allowance(AssetType.COLLATERAL) — méthode officielle py-clob-client
-FIX: Division par 1_000_000 (USDC = 6 décimales)
-FIX: Sync auto sans bug limite journalière
+POLYMARKET BTC BOT v10.4
+FIX: get_balance_allowance avec BalanceAllowanceParams (pas un dict)
 """
 
 import asyncio, logging, os, json, time, math, aiohttp
@@ -64,40 +62,61 @@ class PolyClient:
 
     async def get_balance(self):
         """
-        ✅ v10.3 — Méthode officielle py-clob-client.
-        get_balance_allowance(AssetType.COLLATERAL) retourne le solde USDC en wei (6 décimales).
-        Bug connu: get_balance() retourne 0 — utiliser get_balance_allowance à la place.
+        ✅ v10.4 — Utilise BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
+        Fix: params doit être un objet, pas un dict
         """
         if not self.ready or not self.client:
             return None
+
+        # Méthode 1 : BalanceAllowanceParams correct
         try:
-            from py_clob_client.clob_types import AssetType
-            result = self.client.get_balance_allowance(
-                params={"asset_type": AssetType.COLLATERAL}
-            )
+            from py_clob_client.clob_types import AssetType, BalanceAllowanceParams
+            params = BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
+            result = self.client.get_balance_allowance(params=params)
             raw = result.get("balance", 0)
             balance = round(int(raw) / 1_000_000, 2)
             log.info(f"✅ Balance COLLATERAL: {balance} USDC (raw={raw})")
             return balance
         except Exception as e:
-            log.warning(f"get_balance_allowance: {e}")
+            log.warning(f"BalanceAllowanceParams: {e}")
 
-        # Fallback: endpoint REST /balance-allowance
+        # Méthode 2 : sans params (certaines versions)
         try:
+            result = self.client.get_balance_allowance()
+            raw = result.get("balance", 0)
+            balance = round(int(raw) / 1_000_000, 2)
+            log.info(f"✅ Balance (no params): {balance} USDC")
+            return balance
+        except Exception as e:
+            log.warning(f"get_balance_allowance no params: {e}")
+
+        # Méthode 3 : endpoint REST direct avec auth L2
+        try:
+            from py_clob_client.headers.headers import create_level_2_headers
+            ts = str(int(time.time() * 1000))
+            headers = create_level_2_headers(
+                signer=self.client.signer,
+                timestamp=ts,
+                method="GET",
+                path="/balance-allowance",
+                body=""
+            )
+            headers["POLY_ADDRESS"] = POLY_PROXY_WALLET
             async with aiohttp.ClientSession() as s:
-                async with s.get(
-                    f"{POLY_HOST}/balance-allowance",
-                    params={"asset_type": "0"},  # 0 = COLLATERAL
-                    timeout=aiohttp.ClientTimeout(total=8)
-                ) as r:
+                async with s.get(f"{POLY_HOST}/balance-allowance",
+                                 params={"asset_type": "0", "token_id": ""},
+                                 headers=headers,
+                                 timeout=aiohttp.ClientTimeout(total=8)) as r:
                     if r.status == 200:
                         d = await r.json()
                         raw = d.get("balance", 0)
                         balance = round(int(raw) / 1_000_000, 2)
-                        log.info(f"✅ Balance REST fallback: {balance} USDC")
+                        log.info(f"✅ Balance REST L2: {balance} USDC")
                         return balance
+                    else:
+                        log.warning(f"Balance REST status: {r.status}")
         except Exception as e:
-            log.warning(f"Balance REST fallback: {e}")
+            log.warning(f"Balance REST L2: {e}")
 
         return None
 
@@ -588,7 +607,7 @@ class State:
                 self.daily_ts=d.get("daily_ts",time.time()); self.paper_mode=d.get("paper_mode",PAPER_MODE)
                 self.skipped=d.get("skipped",0); self.pass_reasons=d.get("pass_reasons",[])
                 self.last_real_balance=d.get("last_real_balance",None)
-                log.info("State v10.3 chargé")
+                log.info("State v10.4 chargé")
         except Exception as e: log.error(f"Load: {e}")
 
 st=State()
@@ -632,10 +651,6 @@ async def job_take_profit(context):
     except Exception as e: log.error(f"job_take_profit: {e}")
 
 async def job_sync_balance(context):
-    """
-    ✅ v10.3 — Sync via get_balance_allowance(AssetType.COLLATERAL)
-    PROTECTION : sync seulement si balance > 1$ (évite reset à 0 si API indispo)
-    """
     if st.paper_mode or not poly.ready or st.bet: return
     try:
         real_bal=await poly.get_balance()
@@ -645,7 +660,7 @@ async def job_sync_balance(context):
                 log.info(f"✅ Bankroll synced: {st.bankroll:.2f}→{real_bal:.2f} USDC")
                 st.bankroll=real_bal
         else:
-            log.warning(f"Sync ignorée — balance={real_bal} (trop bas ou API indispo)")
+            log.warning(f"Sync ignorée — balance={real_bal}")
     except Exception as e: log.warning(f"Balance sync: {e}")
 
 async def job_price(context):
@@ -759,7 +774,7 @@ async def cmd_start(update,context):
     if not auth(update): return
     w=POLY_FUNDER_WALLET or POLY_PROXY_WALLET or "?"
     await update.message.reply_text(
-        f"🧠 *POLYMARKET BOT v10.3*\n━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"🧠 *POLYMARKET BOT v10.4*\n━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"Mode:*{'📄 PAPER' if st.paper_mode else '💰 RÉEL'}* | API:{'✅' if poly.ready else '❌'}\n"
         f"Wallet:`{w[:6]}...{w[-4:]}`\n\n"
         f"*/run* */stop* */status* */signal* */score*\n*/market* */balance* */trades* */stats* */paper*",
@@ -792,7 +807,7 @@ async def cmd_run(update,context):
     st.bal_job=context.job_queue.run_repeating(job_sync_balance,interval=300,first=60)
     st.fg=await fetch_fear_greed(); st.btc24=await fetch_btc_24h(); sess=session_ctx()
     await update.message.reply_text(
-        f"▶️ *Bot v10.3 démarré !*\nMode:*{'📄 PAPER' if st.paper_mode else '💰 RÉEL'}*\n"
+        f"▶️ *Bot v10.4 démarré !*\nMode:*{'📄 PAPER' if st.paper_mode else '💰 RÉEL'}*\n"
         f"F&G:`{st.fg['value']}` | BTC:`{st.btc24.get('change_pct',0):+.2f}%`\n"
         f"Session:`{sess['session']}` | Solde:`{st.bankroll:.2f} USDC`",parse_mode="Markdown")
     await job_tick(context)
@@ -818,7 +833,7 @@ async def cmd_status(update,context):
         if st.entry_token_price>0: bet_info+=f" token@{st.entry_token_price:.3f}"
     real_txt=f" (réel:{st.last_real_balance:.2f}$)" if st.last_real_balance else ""
     await update.message.reply_text(
-        f"📊 *STATUS v10.3* [{'📄' if st.paper_mode else '💰'}]\n━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"📊 *STATUS v10.4* [{'📄' if st.paper_mode else '💰'}]\n━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"{'🟢 EN COURS' if st.running else '🔴 ARRÊTÉ'} | {'✅ CLOB' if poly.ready else '❌ CLOB'}\n\n"
         f"₿`${st.price:,.2f}` | F&G:`{st.fg['value']}` | `{sess['session']}`\n"
         f"🎯 {score_info}\n\n"
@@ -828,7 +843,6 @@ async def cmd_status(update,context):
         parse_mode="Markdown",reply_markup=kb())
 
 async def cmd_balance(update,context):
-    """✅ v10.3 — get_balance_allowance(AssetType.COLLATERAL)"""
     if not auth(update): return
     if st.paper_mode:
         await update.message.reply_text(f"📄 *Paper Mode*\nBR simulée:`{st.bankroll:.2f}$`",parse_mode="Markdown"); return
@@ -1015,18 +1029,24 @@ async def cmd_debug(update,context):
     results=[f"POLY_FUNDER_WALLET:{w[:10]}...",
              f"POLY_PROXY_WALLET:{POLY_PROXY_WALLET[:10] if POLY_PROXY_WALLET else 'vide'}...",
              f"PAPER_MODE:{st.paper_mode}",f"poly.ready:{poly.ready}",
-             f"Bankroll:{st.bankroll:.2f}$",f"Dernière balance réelle:{st.last_real_balance or '?'}$"]
+             f"Bankroll:{st.bankroll:.2f}$",f"Dernière balance:{st.last_real_balance or '?'}$"]
     if poly.ready:
-        bal=await poly.get_balance()
-        results.append(f"Balance get_balance_allowance:{bal}")
-        # Test AssetType direct
+        # Test toutes les méthodes
         try:
-            from py_clob_client.clob_types import AssetType
-            raw=poly.client.get_balance_allowance(params={"asset_type":AssetType.COLLATERAL})
-            results.append(f"Raw result:{raw}")
+            from py_clob_client.clob_types import AssetType, BalanceAllowanceParams
+            params=BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
+            raw=poly.client.get_balance_allowance(params=params)
+            results.append(f"BalanceAllowanceParams OK: {raw}")
         except Exception as e:
-            results.append(f"AssetType error:{e}")
-    await update.message.reply_text("🔍 *DEBUG v10.3*\n"+"\n".join(f"`{r}`" for r in results),parse_mode="Markdown")
+            results.append(f"BalanceAllowanceParams ERR: {e}")
+        try:
+            raw2=poly.client.get_balance_allowance()
+            results.append(f"No params: {raw2}")
+        except Exception as e:
+            results.append(f"No params ERR: {e}")
+        bal=await poly.get_balance()
+        results.append(f"get_balance() final: {bal}")
+    await update.message.reply_text("🔍 *DEBUG v10.4*\n"+"\n".join(f"`{r}`" for r in results),parse_mode="Markdown")
 
 async def cb(update,context):
     q=update.callback_query; await q.answer()
@@ -1044,7 +1064,7 @@ def main():
         ("paper",cmd_paper),("cooldown",cmd_cooldown),("reset",cmd_reset),("debug",cmd_debug)]:
         app.add_handler(CommandHandler(name,handler))
     app.add_handler(CallbackQueryHandler(cb))
-    log.info("🧠 PolyBot v10.3 démarré")
+    log.info("🧠 PolyBot v10.4 démarré")
     app.run_polling(drop_pending_updates=True)
 
 if __name__=="__main__":
