@@ -872,18 +872,12 @@ async def tick(context: ContextTypes.DEFAULT_TYPE):
         log.info("Marché en range — pause automatique")
         return
 
-    # Filtre rebond — ne pas rebetter dans la même direction immédiatement après un WIN
-    # et attendre 1 tick (5min) après une perte dans la même direction
+    # Filtre pertes consécutives — cooldown forcé après 2 pertes
     now = time.time()
-    if st.last_trade_dir and (now - st.last_trade_ts) < 300:
-        if st.last_trade_result == "WIN":
-            log.info(f"Pause après WIN {st.last_trade_dir} — attendre nouveau setup")
-            st.skipped_trades += 1
-            return
-        elif st.last_trade_result == "LOSS" and st.consec_losses >= 2:
-            log.info(f"2 pertes consécutives — cooldown forcé")
-            st.cooldown_until = time.time() + COOLDOWN_MIN * 60
-            return
+    if st.last_trade_result == "LOSS" and st.consec_losses >= 2 and (now - st.last_trade_ts) < 300:
+        log.info(f"2 pertes consécutives — cooldown forcé 30min")
+        st.cooldown_until = time.time() + COOLDOWN_MIN * 60
+        return
 
     # Claude AI décide
     decision = await claude_decide(
