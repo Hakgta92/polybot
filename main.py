@@ -103,6 +103,127 @@ def vwap_calc(candles):
     if tv == 0: return candles[-1]["close"]
     return round(sum(((c["high"]+c["low"]+c["close"])/3)*c["vol"] for c in candles)/tv, 2)
 
+def detect_divergence(candles_5m, candles_1m):
+    """Détecte divergence haussière/baissière (prix vs RSI)"""
+    if len(candles_5m) < 10 or len(candles_1m) < 10:
+        return None
+    
+    c5 = [c["close"] for c in candles_5m[-10:]]
+    r5 = [rsi([c["close"] for c in candles_5m[max(0,i-14):i+1]]) 
+          for i in range(len(candles_5m)-10, len(candles_5m))]
+    
+    if len(c5) < 4 or len(r5) < 4:
+        return None
+    
+    # Divergence haussière: prix fait nouveau bas mais RSI monte
+    price_lower = c5[-1] < c5[-3]
+    rsi_higher  = r5[-1] > r5[-3]
+    if price_lower and rsi_higher and r5[-1] < 40:
+        return "BULLISH"
+    
+    # Divergence baissière: prix fait nouveau haut mais RSI baisse
+    price_higher = c5[-1] > c5[-3]
+    rsi_lower    = r5[-1] < r5[-3]
+    if price_higher and rsi_lower and r5[-1] > 60:
+        return "BEARISH"
+    
+    return None
+
+def detect_engulfing(candles):
+    """Détecte bougie engulfing (signal de retournement fort)"""
+    if len(candles) < 3:
+        return None
+    
+    prev = candles[-2]
+    curr = candles[-1]
+    
+    prev_body = abs(prev["close"] - prev["open"])
+    curr_body = abs(curr["close"] - curr["open"])
+    
+    if prev_body == 0:
+        return None
+    
+    # Engulfing haussier: précédente rouge, actuelle verte et plus grande
+    if (prev["close"] < prev["open"] and  # prev bearish
+        curr["close"] > curr["open"] and  # curr bullish
+        curr["open"] < prev["close"] and  # opens below prev close
+        curr["close"] > prev["open"] and  # closes above prev open
+        curr_body > prev_body * 1.2):     # 20% bigger
+        return "BULLISH"
+    
+    # Engulfing baissier
+    if (prev["close"] > prev["open"] and
+        curr["close"] < curr["open"] and
+        curr["open"] > prev["close"] and
+        curr["close"] < prev["open"] and
+        curr_body > prev_body * 1.2):
+        return "BEARISH"
+    
+    return None
+
+def detect_vwap_break(candles, lookback=6):
+    """Détecte cassure du VWAP avec volume"""
+    if len(candles) < lookback + 2:
+        return None
+    
+    vw = vwap_calc(candles[-20:])
+    prev_price = candles[-2]["close"]
+    curr_price = candles[-1]["close"]
+    vols = [c["vol"] for c in candles[-lookback:]]
+    avg_vol = sum(vols) / len(vols) if vols else 1
+    curr_vol = candles[-1]["vol"]
+    
+    vol_confirmed = curr_vol > avg_vol * 1.3
+    
+    # Cassure haussière: prix passe au-dessus VWAP
+    if prev_price < vw and curr_price > vw and vol_confirmed:
+        return "BULLISH"
+    
+    # Cassure baissière: prix passe en-dessous VWAP
+    if prev_price > vw and curr_price < vw and vol_confirmed:
+        return "BEARISH"
+    
+    return None
+
+def compute_advanced_signals(candles_5m, candles_1m):
+    """Calcule tous les signaux avancés"""
+    div  = detect_divergence(candles_5m, candles_1m)
+    eng  = detect_engulfing(candles_5m[-3:]) if len(candles_5m) >= 3 else None
+    vb   = detect_vwap_break(candles_5m)
+    
+    signals = []
+    score = 0
+    
+    if div == "BULLISH":
+        signals.append("🔄 Divergence RSI haussière (signal fort UP)")
+        score += 2
+    elif div == "BEARISH":
+        signals.append("🔄 Divergence RSI baissière (signal fort DOWN)")
+        score -= 2
+    
+    if eng == "BULLISH":
+        signals.append("🕯️ Engulfing haussier détecté")
+        score += 2
+    elif eng == "BEARISH":
+        signals.append("🕯️ Engulfing baissier détecté")
+        score -= 2
+    
+    if vb == "BULLISH":
+        signals.append("📊 Cassure VWAP haussière avec volume")
+        score += 1
+    elif vb == "BEARISH":
+        signals.append("📊 Cassure VWAP baissière avec volume")
+        score -= 1
+    
+    return {
+        "divergence": div,
+        "engulfing":  eng,
+        "vwap_break": vb,
+        "signals":    signals,
+        "score":      score,
+        "bias":       "UP" if score > 0 else "DOWN" if score < 0 else None
+    }
+
 def pivot_sr(candles, lookback=20):
     if len(candles) < lookback: return [], []
     highs = [c["high"] for c in candles[-lookback:]]
@@ -283,13 +404,14 @@ async def fetch_btc_24h():
     return {"change_pct": 0, "high_24h": 0, "low_24h": 0, "volume": 0}
 
 # ─── CLAUDE AI v7 ──────────────────────────────────────────────────────────
-async def claude_decide(i1, i5, i15, i1h, trades, bankroll, consec, fg, btc24, sess):
+async def claude_decide(i1, i5, i15, i1h, adv, trades, bankroll, consec, fg, btc24, sess):
     if not ANTHROPIC_KEY:
         return {"dir":None,"conf":0,"size":0,"reasoning":"Pas de clé API.","trade":False}
 
     patterns = pattern_mem(trades)
     trades_txt = "".join(f"  {t['result']} {t['dir']} PnL:{t['pnl']:+.2f}$ conf:{t.get('conf',0)*100:.0f}%\n"
                          for t in trades[-6:]) or "  Aucun trade.\n"
+    adv_txt = "\n".join(adv.get("signals",[])) or "Aucun signal avancé détecté."
 
     sup_str = str(i5.get("supports",[])) or "Aucun"
     res_str = str(i5.get("resistances",[])) or "Aucun"
@@ -304,17 +426,30 @@ Fear&Greed: {fg['value']}/100 ({fg['label']})
 BTC 24h: {btc24['change_pct']:+.2f}% | High:{btc24['high_24h']:,.0f} Low:{btc24['low_24h']:,.0f}
 Session: {sess['session']} ({sess['quality']}) | Heure Paris: {(datetime.utcnow().hour+2)%24}h
 
-━━━ TENDANCE DOMINANTE (1H) ━━━
+━━━ TENDANCE DOMINANTE (15M) ━━━
+EMA 15m: {'HAUSSIER' if i15.get('ema_bull') else 'BAISSIER'}
+MACD 15m: {i15.get('macd_hist',0):+.4f}
+RSI 15m: {i15.get('rsi_14',50)}
+Momentum 15m: {i15.get('momentum',0):+.2f}
+⚠️ La tendance 15m est le signal DOMINANT pour trader le 5m. Plus réactif et fiable.
+
+━━━ CONTEXTE 1H (tendance de fond) ━━━
 EMA 1h: {'HAUSSIER' if i1h.get('ema_bull') else 'BAISSIER'}
 MACD 1h: {i1h.get('macd_hist',0):+.4f}
 RSI 1h: {i1h.get('rsi_14',50)}
-Momentum 1h: {i1h.get('momentum',0):+.2f}
-⚠️ La tendance 1h est le signal DOMINANT. Ne pas aller contre sans RSI extrême (<15 ou >85).
+→ Si 15m ET 1h alignés = signal FORT (mise max)
+→ Si 15m seul = signal MOYEN (mise réduite)
+→ Si 15m contre 1h = PASS sauf RSI 5m extrême (<15 ou >85)
 
 ━━━ NIVEAUX CLÉS ━━━
 Prix: ${i5.get('price',0):,.2f}
 Supports: {sup_str} | Résistances: {res_str}
 VWAP 5m: ${i5.get('vwap',0):,.0f} ({'AU-DESSUS' if i5.get('above_vwap') else 'EN-DESSOUS'})
+
+━━━ SIGNAUX AVANCÉS ━━━
+{adv_txt}
+Score avancé: {adv['score']:+d} | Biais: {adv['bias'] or 'NEUTRE'}
+⚡ Ces signaux sont très fiables — accorde leur un poids FORT dans ta décision.
 
 ━━━ INDICATEURS 5M (principal) ━━━
 RSI 7/14: {i5.get('rsi_7',50)}/{i5.get('rsi_14',50)}
@@ -334,13 +469,31 @@ Derniers trades:
 {trades_txt}Pertes consécutives: {consec} | Bankroll: {bankroll:.2f}$
 
 ━━━ RÈGLES ━━━
-1. SUIVRE tendance 1h sauf RSI 5m < 15 (UP) ou > 85 (DOWN)
-2. Signal FORT (mise max {max_bet}$): 3+ TF alignés + volume x>1.3 + session EXCELLENT
-3. Signal MOYEN (mise {mid_bet}$): 2 TF alignés dans sens 1h + session GOOD+
-4. PASS si: ATR < 0.04% | tous TF contradictoires | prix exactement sur S/R
-5. Fear&Greed < 15 en tendance NEUTRE → biais UP | > 80 → biais DOWN
-6. Après 2 pertes → mise minimum {MIN_BET_USD}$ seulement
-7. Session US_OPEN/US_AFTERNOON → bonus confiance
+1. SIGNAL DOMINANT = 15m. Suivre sa direction sauf si 1h contradictoire fort.
+2. Signal FORT (mise max {max_bet}$):
+   - 15m ET 1h alignés dans même direction
+   - MACD 15m confirmé + volume x>1.2
+   - Session EXCELLENT (US_OPEN/US_AFTERNOON)
+3. Signal MOYEN (mise {mid_bet}$):
+   - 15m aligné seul (1h neutre ou légèrement contre)
+   - RSI 5m confirme direction (< 40 pour UP, > 60 pour DOWN)
+   - Session GOOD+
+4. Signal COUNTER-TREND (mise min {MIN_BET_USD}$):
+   - RSI 5m extrême (<15=UP ou >85=DOWN) même si 15m contre
+   - Seulement si volume x>1.5 confirme retournement
+5. PASS absolu si:
+   - ATR 5m < 0.04% (marché mort)
+   - 15m ET 1h contradictoires ET RSI neutre (35-65)
+   - Prix exactement entre support et résistance serrés
+   - Volume x<0.3 (marché vide)
+6. RÈGLES AVANCÉES:
+   - RSI divergence: RSI 5m monte mais prix baisse → signal UP fort
+   - Engulfing: grande bougie dans sens 15m après consolidation → trader
+   - VWAP break: prix passe au-dessus/dessous VWAP avec volume → signal fort
+   - Fear&Greed < 15 + 15m neutre → biais UP (rebond macro probable)
+   - Fear&Greed > 80 → biais DOWN
+7. Après 2 pertes consécutives → mise minimum {MIN_BET_USD}$ uniquement
+8. Session US_OPEN/US_AFTERNOON → augmenter confiance, c'est le meilleur moment
 
 RÉPONDS UNIQUEMENT EN JSON (rien d'autre):
 {{"trade":true/false,"direction":"UP"/"DOWN"/null,"confidence":0.0-1.0,"bet_size":{MIN_BET_USD}-{max_bet},"reasoning":"2-3 phrases FR","key_signals":["s1","s2","s3"],"risk_level":"LOW"/"MEDIUM"/"HIGH"}}"""
@@ -582,7 +735,8 @@ async def job_tick(context):
     if not i5: return
 
     # Claude décide
-    dec = await claude_decide(i1, i5, i15, i1h, st.trades[-15:],
+    adv = compute_advanced_signals(list(st.c5), list(st.c1))
+    dec = await claude_decide(i1, i5, i15, i1h, adv, st.trades[-15:],
                               st.bankroll, st.consec, st.fg, st.btc24, sess)
     st.last_decision = dec
 
@@ -608,7 +762,7 @@ async def job_tick(context):
                    f"━━━━━━━━━━━━━━━\n"
                    f"*{dec['dir']}* | `{amount:.2f}$` | `{dec['conf']*100:.0f}%` | {risk_e}\n"
                    f"BTC: `${st.price:,.2f}` | `{sess['session']}`\n"
-                   f"F&G: `{st.fg['value']}` | 1h: `{'↑' if i1h.get('ema_bull') else '↓'}`\n\n"
+                   f"F&G: `{st.fg['value']}` | 15m:`{'↑' if i15.get('ema_bull') else '↓'}` 1h:`{'↑' if i1h.get('ema_bull') else '↓'}`\n\n"
                    f"💭 _{dec['reasoning']}_\n\n"
                    f"🔑 Signaux:\n{sigs}")
             await send(context.bot, msg)
@@ -761,7 +915,8 @@ async def cmd_signal(update: Update, context):
     i1=compute_ind(list(st.c1)); i5=compute_ind(list(st.c5))
     i15=compute_ind(list(st.c15)); i1h=compute_ind(list(st.c1h))
     sess=session_ctx()
-    d=await claude_decide(i1,i5,i15,i1h,st.trades[-15:],st.bankroll,
+    adv=compute_advanced_signals(list(st.c5),list(st.c1))
+    d=await claude_decide(i1,i5,i15,i1h,adv,st.trades[-15:],st.bankroll,
                           st.consec,st.fg,st.btc24,sess)
     st.last_decision=d
     dir_e="🟢" if d["dir"]=="UP" else "🔴" if d["dir"]=="DOWN" else "⚪"
@@ -772,7 +927,7 @@ async def cmd_signal(update: Update, context):
         f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"{dir_e} *{d['dir'] or 'PASS'}* | {risk_e} | `{d['conf']*100:.0f}%`\n"
         f"₿ `${i5.get('price',0):,.2f}` | F&G:`{st.fg['value']}` | `{sess['session']}`\n"
-        f"1h: `{'↑' if i1h.get('ema_bull') else '↓'}` EMA | MACD:`{i1h.get('macd_hist',0):+.2f}`\n\n"
+        f"15m: `{'↑' if i15.get('ema_bull') else '↓'}` EMA | MACD:`{i15.get('macd_hist',0):+.2f}` | 1h:`{'↑' if i1h.get('ema_bull') else '↓'}`\n\n"
         f"💭 _{d['reasoning']}_\n\n"
         f"🔑 Signaux:\n{sigs or '  Aucun'}",
         parse_mode="Markdown"
