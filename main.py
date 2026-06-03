@@ -350,21 +350,62 @@ async def fetch_fear_greed():
     return {"value": 50, "label": "Neutral"}
 
 async def fetch_btc_24h():
-    """Variation BTC sur 24h"""
+    """Variation BTC sur 24h — multiple sources"""
+    # Binance
     try:
         url = "https://api.binance.com/api/v3/ticker/24hr?symbol=BTCUSDT"
+        async with aiohttp.ClientSession() as s:
+            async with s.get(url, timeout=aiohttp.ClientTimeout(total=6)) as r:
+                if r.status == 200:
+                    d = await r.json()
+                    if float(d.get("highPrice", 0)) > 0:
+                        return {
+                            "change_pct": round(float(d["priceChangePercent"]), 2),
+                            "high_24h": float(d["highPrice"]),
+                            "low_24h": float(d["lowPrice"]),
+                            "volume_24h": round(float(d["volume"]), 2),
+                        }
+    except: pass
+
+    # Kraken fallback
+    try:
+        url = "https://api.kraken.com/0/public/Ticker?pair=XBTUSD"
+        async with aiohttp.ClientSession() as s:
+            async with s.get(url, timeout=aiohttp.ClientTimeout(total=6)) as r:
+                if r.status == 200:
+                    d = await r.json()
+                    t = d.get("result", {}).get("XXBTZUSD", {})
+                    if t:
+                        price = float(t["c"][0])
+                        open_p = float(t["o"])
+                        high_24h = float(t["h"][0])
+                        low_24h  = float(t["l"][0])
+                        vol_24h  = float(t["v"][0])
+                        change_pct = ((price - open_p) / open_p * 100) if open_p > 0 else 0
+                        return {
+                            "change_pct": round(change_pct, 2),
+                            "high_24h": high_24h,
+                            "low_24h": low_24h,
+                            "volume_24h": round(vol_24h, 2),
+                        }
+    except: pass
+
+    # CoinGecko fallback
+    try:
+        url = "https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd&include_24hr_change=true&include_24hr_vol=true&include_high_24h=true&include_low_24h=true"
         async with aiohttp.ClientSession() as s:
             async with s.get(url, timeout=aiohttp.ClientTimeout(total=8)) as r:
                 if r.status == 200:
                     d = await r.json()
+                    btc = d.get("bitcoin", {})
                     return {
-                        "change_pct": round(float(d["priceChangePercent"]), 2),
-                        "high_24h": float(d["highPrice"]),
-                        "low_24h": float(d["lowPrice"]),
-                        "volume_24h": round(float(d["volume"]), 2),
+                        "change_pct": round(btc.get("usd_24h_change", 0), 2),
+                        "high_24h": btc.get("usd_24h_high", 0) or 0,
+                        "low_24h":  btc.get("usd_24h_low", 0) or 0,
+                        "volume_24h": btc.get("usd_24h_vol", 0) or 0,
                     }
-    except:
-        pass
+    except: pass
+
     return {"change_pct": 0, "high_24h": 0, "low_24h": 0, "volume_24h": 0}
 
 # ─── POLYMARKET SENTIMENT ──────────────────────────────────────────────────
@@ -487,11 +528,11 @@ SENTIMENT POLYMARKET (CRUCIAL)
 ═══════════════════════════════
 {poly_str}
 
-⚡ Le sentiment Polymarket = ce que les VRAIS traders parient avec du vrai argent.
-C'est le signal le plus fiable disponible. Accorde-lui un poids MAJEUR.
-Si Poly dit DOWN à 75%+ → forte probabilité DOWN, même si TF mitigés.
-Si Poly dit UP à 75%+ → forte probabilité UP, même si TF mitigés.
-Si Poly est neutre (45-55%) → se baser uniquement sur les TF.
+⚡ Le sentiment Polymarket = signal bonus très utile MAIS OPTIONNEL.
+- Si disponible et biais fort (75%+) → accorde-lui du poids supplémentaire
+- Si NON DISPONIBLE → ignore complètement et base-toi sur les indicateurs techniques
+- Ne PAS refuser de trader uniquement parce que Poly est indisponible
+- Les indicateurs techniques seuls sont suffisants pour décider
 
 ═══════════════════════════════
 PRIX & NIVEAUX CLÉS
