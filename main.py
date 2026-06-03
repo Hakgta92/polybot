@@ -1,7 +1,7 @@
 """
-POLYMARKET BTC BOT v10.5
-FIX: BalanceAllowanceParams correct
-ADD: /debug affiche version + méthodes disponibles dans py-clob-client
+POLYMARKET BTC BOT v10.6
+FIX: update_balance_allowance au démarrage (approve contrats Polymarket)
+FIX: balance '0' string converti correctement
 """
 
 import asyncio, logging, os, json, time, math, aiohttp
@@ -10,7 +10,7 @@ from collections import deque
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 
-BOT_VERSION = "10.5"
+BOT_VERSION = "10.6"
 
 def load_env():
     env_path = os.path.join(os.path.dirname(__file__), '.env')
@@ -48,7 +48,7 @@ log = logging.getLogger(__name__)
 
 class PolyClient:
     def __init__(self):
-        self.client=None; self.ready=False
+        self.client=None; self.ready=False; self.allowance_set=False
 
     def init_client(self):
         if not POLY_PRIVATE_KEY or not POLY_PROXY_WALLET:
@@ -63,62 +63,49 @@ class PolyClient:
         except ImportError: log.error("py-clob-client non installé"); return False
         except Exception as e: log.error(f"Polymarket init: {e}"); return False
 
+    def set_allowances(self):
+        """
+        ✅ v10.6 — Approve les contrats Polymarket pour accéder aux USDC.
+        Magic.link / email wallet = signature_type=1, les allowances sont
+        normalement auto mais on les force au cas où.
+        """
+        if not self.ready or not self.client or self.allowance_set:
+            return
+        try:
+            from py_clob_client.clob_types import AssetType, BalanceAllowanceParams
+            # Approve USDC (collateral)
+            self.client.update_balance_allowance(
+                params=BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
+            )
+            log.info("✅ Allowance COLLATERAL mise à jour")
+            self.allowance_set = True
+        except Exception as e:
+            log.warning(f"set_allowances: {e}")
+
     async def get_balance(self):
         """
-        v10.5 — Essaie toutes les variantes possibles de get_balance_allowance
+        ✅ v10.6 — Lit la balance après avoir forcé les allowances.
+        Le debug montre que v1 (BalanceAllowanceParams) fonctionne
+        mais retourne '0' car allowances pas encore set.
         """
         if not self.ready or not self.client:
             return None
 
-        # Variante 1 : BalanceAllowanceParams object
+        # S'assure que les allowances sont set
+        if not self.allowance_set:
+            self.set_allowances()
+
         try:
             from py_clob_client.clob_types import AssetType, BalanceAllowanceParams
             params = BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
             result = self.client.get_balance_allowance(params=params)
             if result:
-                raw = result.get("balance", 0)
+                raw = result.get("balance", "0")
                 balance = round(int(raw) / 1_000_000, 2)
-                log.info(f"✅ v1 BalanceAllowanceParams: {balance} USDC")
+                log.info(f"✅ Balance: {balance} USDC (raw={raw})")
                 return balance
         except Exception as e:
-            log.warning(f"v1 BalanceAllowanceParams: {e}")
-
-        # Variante 2 : sans argument
-        try:
-            result = self.client.get_balance_allowance()
-            if result:
-                raw = result.get("balance", 0)
-                balance = round(int(raw) / 1_000_000, 2)
-                log.info(f"✅ v2 no args: {balance} USDC")
-                return balance
-        except Exception as e:
-            log.warning(f"v2 no args: {e}")
-
-        # Variante 3 : asset_type comme entier
-        try:
-            result = self.client.get_balance_allowance(asset_type=0)
-            if result:
-                raw = result.get("balance", 0)
-                balance = round(int(raw) / 1_000_000, 2)
-                log.info(f"✅ v3 asset_type=0: {balance} USDC")
-                return balance
-        except Exception as e:
-            log.warning(f"v3 asset_type=0: {e}")
-
-        # Variante 4 : get_balance() simple
-        try:
-            result = self.client.get_balance()
-            if result is not None:
-                # Peut être un float directement ou un dict
-                if isinstance(result, (int, float)):
-                    balance = round(float(result), 2)
-                else:
-                    raw = result.get("balance", 0)
-                    balance = round(int(raw) / 1_000_000, 2)
-                log.info(f"✅ v4 get_balance(): {balance} USDC")
-                return balance
-        except Exception as e:
-            log.warning(f"v4 get_balance(): {e}")
+            log.warning(f"get_balance: {e}")
 
         return None
 
@@ -790,6 +777,9 @@ async def cmd_run(update,context):
         if not poly.init_client():
             await update.message.reply_text("⚠️ Polymarket indispo — paper mode activé",parse_mode="Markdown")
             st.paper_mode=True
+        else:
+            # Force les allowances au démarrage
+            poly.set_allowances()
     st.running=True; st.session_start=time.time()
     if not st.paper_mode and poly.ready:
         await update.message.reply_text("⏳ Sync balance Polymarket...")
@@ -864,8 +854,7 @@ async def cmd_balance(update,context):
     else:
         await update.message.reply_text(
             f"❌ *Balance indisponible*\n🔑`{short}`\n"
-            f"Dernière valeur connue:`{st.last_real_balance or '?'}$`\n"
-            f"→ Vérifie POLY_PRIVATE_KEY dans Railway",parse_mode="Markdown")
+            f"Dernière valeur connue:`{st.last_real_balance or '?'}$`",parse_mode="Markdown")
 
 async def cmd_market(update,context):
     if not auth(update): return
@@ -1026,72 +1015,40 @@ async def cmd_cooldown(update,context):
     await update.message.reply_text("✅ Cooldown reset.",parse_mode="Markdown")
 
 async def cmd_debug(update,context):
-    """DEBUG COMPLET v10.5 — version + méthodes py-clob-client disponibles"""
     if not auth(update): return
     w=POLY_FUNDER_WALLET or POLY_PROXY_WALLET or "NON CONFIGURÉ"
     results=[
-        f"🤖 BOT VERSION: {BOT_VERSION}",
-        f"POLY_FUNDER_WALLET:{w[:10]}...",
-        f"POLY_PROXY_WALLET:{POLY_PROXY_WALLET[:10] if POLY_PROXY_WALLET else 'vide'}...",
+        f"🤖 VERSION:{BOT_VERSION}",
+        f"WALLET:{w[:10]}...",
         f"PAPER_MODE:{st.paper_mode}",
         f"poly.ready:{poly.ready}",
+        f"allowance_set:{poly.allowance_set}",
         f"Bankroll:{st.bankroll:.2f}$",
         f"Dernière balance:{st.last_real_balance or '?'}$"
     ]
-
-    # Version py-clob-client
-    try:
-        import py_clob_client
-        results.append(f"py-clob-client version:{py_clob_client.__version__}")
-    except:
-        results.append("py-clob-client version: inconnue")
-
-    # Méthodes disponibles sur client
     if poly.ready and poly.client:
-        methods = [m for m in dir(poly.client) if 'balance' in m.lower()]
-        results.append(f"Méthodes balance:{methods}")
-
-        # Test variante 1
+        # Force set allowances et relit
         try:
             from py_clob_client.clob_types import AssetType, BalanceAllowanceParams
-            params=BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
-            r=poly.client.get_balance_allowance(params=params)
-            results.append(f"v1 BalanceAllowanceParams:{r}")
+            # Update allowance
+            upd=poly.client.update_balance_allowance(
+                params=BalanceAllowanceParams(asset_type=AssetType.COLLATERAL))
+            results.append(f"update_allowance:{upd}")
+            # Relit après update
+            r=poly.client.get_balance_allowance(
+                params=BalanceAllowanceParams(asset_type=AssetType.COLLATERAL))
+            results.append(f"balance après update:{r}")
+            raw=r.get("balance","0") if r else "0"
+            balance=round(int(raw)/1_000_000,2)
+            results.append(f"USDC calculé:{balance}$")
         except Exception as e:
-            results.append(f"v1 ERR:{str(e)[:80]}")
-
-        # Test variante 2
-        try:
-            r=poly.client.get_balance_allowance()
-            results.append(f"v2 no args:{r}")
-        except Exception as e:
-            results.append(f"v2 ERR:{str(e)[:80]}")
-
-        # Test variante 3
-        try:
-            r=poly.client.get_balance_allowance(asset_type=0)
-            results.append(f"v3 int 0:{r}")
-        except Exception as e:
-            results.append(f"v3 ERR:{str(e)[:80]}")
-
-        # Test get_balance
-        try:
-            r=poly.client.get_balance()
-            results.append(f"v4 get_balance:{r}")
-        except Exception as e:
-            results.append(f"v4 ERR:{str(e)[:80]}")
+            results.append(f"ERR:{str(e)[:100]}")
 
     bal=await poly.get_balance()
-    results.append(f"FINAL get_balance():{bal}")
+    results.append(f"get_balance() final:{bal}")
 
-    # Envoyer en 2 messages si trop long
-    msg="🔍 *DEBUG v10.5*\n"+"\n".join(f"`{r}`" for r in results)
-    if len(msg)>4000:
-        mid=len(results)//2
-        await send(update.message.bot,"🔍 *DEBUG v10.5 (1/2)*\n"+"\n".join(f"`{r}`" for r in results[:mid]),parse_mode="Markdown")
-        await update.message.reply_text("🔍 *DEBUG v10.5 (2/2)*\n"+"\n".join(f"`{r}`" for r in results[mid:]),parse_mode="Markdown")
-    else:
-        await update.message.reply_text(msg,parse_mode="Markdown")
+    msg="🔍 *DEBUG v10.6*\n"+"\n".join(f"`{r}`" for r in results)
+    await update.message.reply_text(msg,parse_mode="Markdown")
 
 async def cb(update,context):
     q=update.callback_query; await q.answer()
@@ -1101,7 +1058,9 @@ async def cb(update,context):
 
 def main():
     st.load()
-    if not st.paper_mode and POLY_PRIVATE_KEY: poly.init_client()
+    if not st.paper_mode and POLY_PRIVATE_KEY:
+        poly.init_client()
+        poly.set_allowances()
     app=Application.builder().token(TOKEN).build()
     for name,handler in [("start",cmd_start),("run",cmd_run),("stop",cmd_stop),("status",cmd_status),
         ("ai",cmd_ai),("signal",cmd_signal),("score",cmd_score),("trades",cmd_trades),("stats",cmd_stats),
