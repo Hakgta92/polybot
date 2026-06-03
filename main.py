@@ -1,7 +1,7 @@
 """
 ╔══════════════════════════════════════════════════════════════╗
-║     POLYMARKET BTC BOT v6 — ENHANCED AI EDITION             ║
-║     Fear&Greed | Macro | Sessions | S/R | Pattern Memory    ║
+║     POLYMARKET BTC BOT v7 — FINAL OPTIMIZED EDITION         ║
+║     Bugs corrigés | Notifications fiables | AI améliorée    ║
 ╚══════════════════════════════════════════════════════════════╝
 """
 
@@ -12,44 +12,40 @@ import json
 import time
 import math
 import aiohttp
-from datetime import datetime, timedelta
+from datetime import datetime
 from collections import deque
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import (
-    Application, CommandHandler, CallbackQueryHandler, ContextTypes
-)
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 
 # ─── CONFIG ────────────────────────────────────────────────────────────────
-TOKEN           = os.getenv("TELEGRAM_TOKEN", "VOTRE_TOKEN_ICI")
-ALLOWED_UID     = int(os.getenv("ALLOWED_USER_ID", "0"))
-ANTHROPIC_KEY   = os.getenv("ANTHROPIC_API_KEY", "")
-PAPER_MODE      = os.getenv("PAPER_MODE", "true").lower() == "true"
-BANKROLL_START  = float(os.getenv("BANKROLL", "50.0"))
+TOKEN          = os.getenv("TELEGRAM_TOKEN", "VOTRE_TOKEN_ICI")
+ALLOWED_UID    = int(os.getenv("ALLOWED_USER_ID", "0"))
+ANTHROPIC_KEY  = os.getenv("ANTHROPIC_API_KEY", "")
+PAPER_MODE     = os.getenv("PAPER_MODE", "true").lower() == "true"
+BANKROLL_START = float(os.getenv("BANKROLL", "50.0"))
 
-MAX_BET_USD     = 5.0
-MIN_BET_USD     = 1.0
-MAX_BET_PCT     = 0.05
-POLY_FEE        = 0.02
-DAILY_LOSS_MAX  = 0.10
-MAX_CONSEC_LOSS = 2
-COOLDOWN_MIN    = 30
-
-BINANCE_KLINES  = "https://api.binance.com/api/v3/klines"
-CLAUDE_API      = "https://api.anthropic.com/v1/messages"
-FEAR_GREED_API  = "https://api.alternative.me/fng/?limit=1"
-POLY_MARKETS    = "https://clob.polymarket.com/markets"
-DATA_FILE       = "polybot_v6_state.json"
+MAX_BET_USD    = 5.0
+MIN_BET_USD    = 1.0
+MAX_BET_PCT    = 0.05
+POLY_FEE       = 0.02
+DAILY_LOSS_MAX = 0.10
+MAX_CONSEC_LOSS= 2
+COOLDOWN_MIN   = 30
+CLAUDE_API     = "https://api.anthropic.com/v1/messages"
+FEAR_GREED_API = "https://api.alternative.me/fng/?limit=1"
+DATA_FILE      = "polybot_v7_state.json"
 
 logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
     level=logging.INFO,
-    handlers=[logging.FileHandler("polybot_v6.log"), logging.StreamHandler()]
+    handlers=[logging.FileHandler("polybot_v7.log"), logging.StreamHandler()]
 )
 log = logging.getLogger(__name__)
 
 # ─── INDICATEURS ───────────────────────────────────────────────────────────
 def ema(values, period):
-    if len(values) < period: return values[-1] if values else 0
+    if not values: return 0
+    if len(values) < period: return values[-1]
     k = 2 / (period + 1)
     e = sum(values[:period]) / period
     for v in values[period:]: e = v * k + e * (1 - k)
@@ -57,7 +53,7 @@ def ema(values, period):
 
 def rsi(closes, period=14):
     if len(closes) < period + 1: return 50.0
-    gains, losses = 0.0, 0.0
+    gains = losses = 0.0
     for i in range(len(closes) - period, len(closes)):
         d = closes[i] - closes[i-1]
         if d > 0: gains += d
@@ -79,10 +75,12 @@ def bollinger(closes, period=20):
     return round(mid-2*std, 2), round(mid, 2), round(mid+2*std, 2)
 
 def atr_calc(candles, period=14):
-    if len(candles) < period+1: return 0.0
-    trs = [max(c["high"]-c["low"], abs(c["high"]-candles[i-1]["close"]),
+    if len(candles) < 2: return 0.0
+    trs = [max(c["high"]-c["low"],
+               abs(c["high"]-candles[i-1]["close"]),
                abs(c["low"]-candles[i-1]["close"]))
            for i, c in enumerate(candles) if i > 0]
+    if not trs: return 0.0
     return round(sum(trs[-period:]) / min(len(trs), period), 2)
 
 def stoch(closes, highs, lows, period=14):
@@ -90,7 +88,7 @@ def stoch(closes, highs, lows, period=14):
     lo, hi = min(lows[-period:]), max(highs[-period:])
     if hi == lo: return 50.0, 50.0
     k = (closes[-1]-lo)/(hi-lo)*100
-    d = (closes[-2]-lo)/(hi-lo)*100 if len(closes) >= period+1 else k
+    d = (closes[-2]-lo)/(hi-lo)*100 if len(closes) > period else k
     return round(k,1), round(d,1)
 
 def williams_r(closes, highs, lows, period=14):
@@ -105,176 +103,87 @@ def vwap_calc(candles):
     if tv == 0: return candles[-1]["close"]
     return round(sum(((c["high"]+c["low"]+c["close"])/3)*c["vol"] for c in candles)/tv, 2)
 
-def support_resistance(candles, lookback=20):
-    """Détecte les niveaux S/R par clustering des pivots"""
+def pivot_sr(candles, lookback=20):
     if len(candles) < lookback: return [], []
     highs = [c["high"] for c in candles[-lookback:]]
     lows  = [c["low"]  for c in candles[-lookback:]]
     price = candles[-1]["close"]
-    atr   = atr_calc(candles)
-
-    # Pivots hauts et bas
-    resistances, supports = [], []
+    atr   = atr_calc(candles) * 3
+    res, sup = [], []
     for i in range(2, len(highs)-2):
         if highs[i] > highs[i-1] and highs[i] > highs[i+1] and highs[i] > highs[i-2] and highs[i] > highs[i+2]:
-            resistances.append(round(highs[i], 2))
+            if highs[i] > price and highs[i]-price < atr:
+                res.append(round(highs[i], 0))
         if lows[i] < lows[i-1] and lows[i] < lows[i+1] and lows[i] < lows[i-2] and lows[i] < lows[i+2]:
-            supports.append(round(lows[i], 2))
+            if lows[i] < price and price-lows[i] < atr:
+                sup.append(round(lows[i], 0))
+    return sorted(set(sup), reverse=True)[:2], sorted(set(res))[:2]
 
-    # Filtrer : proches du prix actuel (dans 2x ATR)
-    threshold = atr * 2
-    near_r = sorted([r for r in resistances if r > price and r - price < threshold])[:3]
-    near_s = sorted([s for s in supports if s < price and price - s < threshold], reverse=True)[:3]
-    return near_s, near_r
-
-def is_trending_market(candles_5m, candles_15m, threshold_pct=0.08):
-    """Retourne True si le marché est en tendance (pas en range)"""
-    if len(candles_5m) < 12 or len(candles_15m) < 6:
-        return False  # pas assez de données, on attend
-
-    hour = datetime.utcnow().hour
-    # Session nuit (22h-7h UTC = 0h-9h Paris) : seuil plus strict
-    if 22 <= hour or hour < 7:
-        threshold_pct = 0.15  # besoin de plus de mouvement la nuit
-
-    # Vérifier le mouvement sur les 30 dernières minutes (6 bougies 5m)
-    recent = candles_5m[-6:]
-    high = max(c["high"] for c in recent)
-    low  = min(c["low"]  for c in recent)
-    price = candles_5m[-1]["close"]
-    if price == 0: return False
-    range_pct = (high - low) / price * 100
-
-    # Vérifier la pente des EMA sur 15m
-    closes_15m = [c["close"] for c in candles_15m[-8:]]
-    ema_slope = abs(closes_15m[-1] - closes_15m[0]) / closes_15m[0] * 100
-
-    # Vérifier le momentum sur 5m (12 dernières bougies = 1h)
-    closes_5m = [c["close"] for c in candles_5m[-12:]]
-    momentum = abs(closes_5m[-1] - closes_5m[0]) / closes_5m[0] * 100
-
-    # Marché en tendance si mouvement de prix suffisant (volume pas requis)
-    is_trending = range_pct > threshold_pct or momentum > threshold_pct * 0.7 or abs(ema_slope) > 0.04
-    
-    if not is_trending:
-        log.info(f"Range détecté: range={range_pct:.3f}% mom={momentum:.3f}% ema_slope={ema_slope:.3f}%")
-    
-    return is_trending
-
-def compute_indicators(candles):
+def compute_ind(candles):
     if len(candles) < 10: return {}
-    closes = [c["close"] for c in candles]
-    highs  = [c["high"]  for c in candles]
-    lows   = [c["low"]   for c in candles]
-    vols   = [c["vol"]   for c in candles]
-    price  = closes[-1]
-
-    e9  = ema(closes, 9)
-    e21 = ema(closes, 21)
-    e50 = ema(closes, min(50, len(closes)))
-    r7  = rsi(closes, 7)
-    r14 = rsi(closes, 14)
-    ml, sig, hist = macd_calc(closes)
-    bb_l, bb_m, bb_h = bollinger(closes)
-    atr = atr_calc(candles)
-    stk, std = stoch(closes, highs, lows)
-    wr  = williams_r(closes, highs, lows)
+    c = [x["close"] for x in candles]
+    h = [x["high"]  for x in candles]
+    l = [x["low"]   for x in candles]
+    v = [x["vol"]   for x in candles]
+    price = c[-1]
+    e9  = ema(c, 9);  e21 = ema(c, 21); e50 = ema(c, min(50,len(c)))
+    r14 = rsi(c, 14); r7  = rsi(c, 7)
+    ml, sg, hist = macd_calc(c)
+    bb_l, bb_m, bb_h = bollinger(c)
+    at  = atr_calc(candles)
+    stk, std = stoch(c, h, l)
+    wr  = williams_r(c, h, l)
     vw  = vwap_calc(candles[-20:])
-    avg_vol = sum(vols[-10:])/10 if len(vols) >= 10 else vols[-1]
-    mom = closes[-1] - closes[-6] if len(closes) >= 6 else 0
-    atr_pct = (atr/price*100) if price > 0 else 0
-    sup, res = support_resistance(candles)
-
+    av  = sum(v[-10:])/10 if len(v)>=10 else v[-1]
+    mom = c[-1]-c[-6] if len(c)>=6 else 0
+    sup, res = pivot_sr(candles)
     return {
-        "price": round(price, 2),
-        "rsi_7": r7, "rsi_14": r14,
+        "price": round(price,2), "rsi_7": r7, "rsi_14": r14,
         "ema9": round(e9,2), "ema21": round(e21,2), "ema50": round(e50,2),
-        "macd_line": ml, "macd_signal": sig, "macd_hist": hist,
+        "macd_hist": hist, "macd_line": ml,
         "bb_low": bb_l, "bb_mid": bb_m, "bb_high": bb_h,
-        "atr": atr, "atr_pct": round(atr_pct, 3),
-        "stoch_k": stk, "stoch_d": std,
-        "williams_r": wr,
+        "atr": at, "atr_pct": round(at/price*100,3) if price else 0,
+        "stoch_k": stk, "stoch_d": std, "williams_r": wr,
         "vwap": vw, "above_vwap": price > vw,
-        "vol_ratio": round(vols[-1]/avg_vol, 2) if avg_vol > 0 else 1.0,
-        "momentum": round(mom, 2),
-        "ema_bull": e9 > e21,
-        "supports": sup,
-        "resistances": res,
-        "candles_count": len(candles),
+        "vol_ratio": round(v[-1]/av,2) if av else 1.0,
+        "momentum": round(mom,2), "ema_bull": e9 > e21,
+        "supports": sup, "resistances": res,
     }
 
-# ─── SESSION TIMING ────────────────────────────────────────────────────────
-def get_session_context():
-    """Retourne le contexte de la session de trading actuelle (heure UTC)"""
-    hour = datetime.utcnow().hour
-    if 0 <= hour < 6:
-        session = "ASIA_EARLY"
-        quality = "MEDIUM — Asie early, peut trader si signal fort"
-    elif 6 <= hour < 8:
-        session = "ASIA_LATE"
-        quality = "GOOD — Fin session Asie, bonne activité"
-    elif 8 <= hour < 12:
-        session = "EUROPE_OPEN"
-        quality = "EXCELLENT — Ouverture Europe, très bonne liquidité"
-    elif 12 <= hour < 14:
-        session = "LUNCH"
-        quality = "MEDIUM — Déjeuner, trader si signal très fort"
-    elif 14 <= hour < 17:
-        session = "US_OPEN"
-        quality = "EXCELLENT — Ouverture US, meilleure liquidité"
-    elif 17 <= hour < 20:
-        session = "US_AFTERNOON"
-        quality = "EXCELLENT — Après-midi US, tendances fortes"
-    elif 20 <= hour < 22:
-        session = "US_CLOSE"
-        quality = "GOOD — Clôture US, encore actif"
-    else:
-        session = "OVERNIGHT"
-        quality = "MEDIUM — Nuit, trader si signal clair"
+def session_ctx():
+    h = datetime.utcnow().hour
+    if   14 <= h < 17: return {"session":"US_OPEN",      "quality":"EXCELLENT", "score_bonus":2}
+    elif 17 <= h < 20: return {"session":"US_AFTERNOON", "quality":"EXCELLENT", "score_bonus":1}
+    elif  8 <= h < 12: return {"session":"EU_OPEN",      "quality":"GOOD",      "score_bonus":1}
+    elif 20 <= h < 22: return {"session":"US_CLOSE",     "quality":"GOOD",      "score_bonus":0}
+    elif  6 <= h <  8: return {"session":"ASIA_LATE",    "quality":"MEDIUM",    "score_bonus":0}
+    elif  0 <= h <  6: return {"session":"ASIA_EARLY",   "quality":"MEDIUM",    "score_bonus":-1}
+    else:              return {"session":"OVERNIGHT",    "quality":"LOW",       "score_bonus":-1}
 
-    return {
-        "session": session,
-        "quality": quality,
-        "hour_utc": hour,
-        "hour_paris": (hour + 2) % 24,
-    }
+def pattern_mem(trades):
+    if len(trades) < 5: return "Moins de 5 trades."
+    wins  = [t for t in trades if t["result"]=="WIN"]
+    losses= [t for t in trades if t["result"]=="LOSS"]
+    up_t  = [t for t in trades if t["dir"]=="UP"]
+    dn_t  = [t for t in trades if t["dir"]=="DOWN"]
+    up_wr = sum(1 for t in up_t if t["result"]=="WIN")/len(up_t)*100 if up_t else 0
+    dn_wr = sum(1 for t in dn_t if t["result"]=="WIN")/len(dn_t)*100 if dn_t else 0
+    cw = sum(t.get("conf",0) for t in wins)/len(wins)*100 if wins else 0
+    cl = sum(t.get("conf",0) for t in losses)/len(losses)*100 if losses else 0
+    return (f"UP:{up_wr:.0f}%({len(up_t)}) DOWN:{dn_wr:.0f}%({len(dn_t)}) | "
+            f"Conf wins:{cw:.0f}% losses:{cl:.0f}%")
 
-# ─── PATTERN MEMORY ────────────────────────────────────────────────────────
-def analyze_patterns(trades):
-    """Analyse les patterns gagnants/perdants dans l'historique"""
-    if len(trades) < 5:
-        return "Pas assez de trades pour analyser les patterns."
-
-    wins  = [t for t in trades if t["result"] == "WIN"]
-    losses= [t for t in trades if t["result"] == "LOSS"]
-
-    # Win rate par direction
-    up_trades   = [t for t in trades if t["dir"] == "UP"]
-    down_trades = [t for t in trades if t["dir"] == "DOWN"]
-    up_wr   = sum(1 for t in up_trades   if t["result"]=="WIN") / len(up_trades)   * 100 if up_trades   else 0
-    down_wr = sum(1 for t in down_trades if t["result"]=="WIN") / len(down_trades) * 100 if down_trades else 0
-
-    # Win rate par heure (si disponible)
-    hour_stats = {}
-    for t in trades:
-        h = datetime.fromtimestamp(t["ts"]).hour
-        if h not in hour_stats: hour_stats[h] = {"w":0,"l":0}
-        if t["result"] == "WIN": hour_stats[h]["w"] += 1
-        else: hour_stats[h]["l"] += 1
-
-    best_hours = sorted(hour_stats.items(), key=lambda x: x[1]["w"]/(x[1]["w"]+x[1]["l"]), reverse=True)[:3]
-    best_hours_str = ", ".join([f"{h}h ({s['w']}/{s['w']+s['l']})" for h, s in best_hours])
-
-    # Confiance moyenne wins vs losses
-    avg_conf_win  = sum(t.get("conf",0) for t in wins)  / len(wins)  * 100 if wins  else 0
-    avg_conf_loss = sum(t.get("conf",0) for t in losses) / len(losses)* 100 if losses else 0
-
-    return (
-        f"Win rate UP: {up_wr:.0f}% ({len(up_trades)} trades) | "
-        f"DOWN: {down_wr:.0f}% ({len(down_trades)} trades)\n"
-        f"Confiance moy. wins: {avg_conf_win:.0f}% | losses: {avg_conf_loss:.0f}%\n"
-        f"Meilleures heures: {best_hours_str}"
-    )
+def is_trending(c5, c15):
+    if len(c5) < 12: return False
+    h = datetime.utcnow().hour
+    thr = 0.12 if (22<=h or h<7) else 0.06
+    closes = [c["close"] for c in c5[-12:]]
+    highs  = [c["high"]  for c in c5[-6:]]
+    lows   = [c["low"]   for c in c5[-6:]]
+    price  = closes[-1] if closes[-1] else 1
+    range_pct = (max(highs)-min(lows))/price*100
+    mom_pct   = abs(closes[-1]-closes[0])/price*100
+    return range_pct > thr or mom_pct > thr*0.7
 
 # ─── DATA FETCH ────────────────────────────────────────────────────────────
 async def fetch_price():
@@ -295,15 +204,16 @@ async def fetch_price():
                     if r.status == 200:
                         p = parser(await r.json())
                         if p > 0:
-                            log.info(f"Price {name}: ${p:,.2f}")
+                            log.info(f"Price {name}: ${p:,.0f}")
                             return p
         except Exception as e:
-            log.warning(f"{name}: {e}")
+            log.warning(f"Price {name}: {e}")
     return st.current_price
 
 async def fetch_klines(interval, limit=60):
+    # Binance
     try:
-        url = f"{BINANCE_KLINES}?symbol=BTCUSDT&interval={interval}&limit={limit}"
+        url = f"https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval={interval}&limit={limit}"
         async with aiohttp.ClientSession() as s:
             async with s.get(url, timeout=aiohttp.ClientTimeout(total=10)) as r:
                 if r.status == 200:
@@ -313,7 +223,8 @@ async def fetch_klines(interval, limit=60):
                                  "close":float(k[4]),"vol":float(k[5]),"ts":int(k[0])//1000}
                                 for k in data]
     except Exception as e:
-        log.warning(f"Binance {interval}: {e}")
+        log.warning(f"Binance klines {interval}: {e}")
+    # Kraken fallback
     try:
         km = {"1m":1,"5m":5,"15m":15,"1h":60}
         url = f"https://api.kraken.com/0/public/OHLC?pair=XBTUSD&interval={km.get(interval,5)}&count={limit}"
@@ -327,419 +238,196 @@ async def fetch_klines(interval, limit=60):
                                  "close":float(k[4]),"vol":float(k[6]),"ts":int(k[0])}
                                 for k in ohlc[-limit:]]
     except Exception as e:
-        log.warning(f"Kraken {interval}: {e}")
+        log.warning(f"Kraken klines {interval}: {e}")
     return []
 
 async def fetch_fear_greed():
-    """Fear & Greed Index (0=Extreme Fear, 100=Extreme Greed)"""
     try:
         async with aiohttp.ClientSession() as s:
             async with s.get(FEAR_GREED_API, timeout=aiohttp.ClientTimeout(total=8)) as r:
                 if r.status == 200:
-                    data = await r.json()
-                    val  = int(data["data"][0]["value"])
-                    name = data["data"][0]["value_classification"]
-                    return {"value": val, "label": name}
-    except Exception as e:
-        log.warning(f"Fear&Greed: {e}")
+                    d = await r.json()
+                    return {"value": int(d["data"][0]["value"]),
+                            "label": d["data"][0]["value_classification"]}
+    except: pass
     return {"value": 50, "label": "Neutral"}
 
 async def fetch_btc_24h():
-    """Variation BTC sur 24h — multiple sources"""
-    # Binance
+    # Kraken first (works on Railway)
     try:
-        url = "https://api.binance.com/api/v3/ticker/24hr?symbol=BTCUSDT"
         async with aiohttp.ClientSession() as s:
-            async with s.get(url, timeout=aiohttp.ClientTimeout(total=6)) as r:
+            async with s.get("https://api.kraken.com/0/public/Ticker?pair=XBTUSD",
+                             timeout=aiohttp.ClientTimeout(total=6)) as r:
                 if r.status == 200:
                     d = await r.json()
-                    if float(d.get("highPrice", 0)) > 0:
-                        return {
-                            "change_pct": round(float(d["priceChangePercent"]), 2),
-                            "high_24h": float(d["highPrice"]),
-                            "low_24h": float(d["lowPrice"]),
-                            "volume_24h": round(float(d["volume"]), 2),
-                        }
-    except: pass
-
-    # Kraken fallback
-    try:
-        url = "https://api.kraken.com/0/public/Ticker?pair=XBTUSD"
-        async with aiohttp.ClientSession() as s:
-            async with s.get(url, timeout=aiohttp.ClientTimeout(total=6)) as r:
-                if r.status == 200:
-                    d = await r.json()
-                    t = d.get("result", {}).get("XXBTZUSD", {})
+                    t = d.get("result",{}).get("XXBTZUSD",{})
                     if t:
-                        price = float(t["c"][0])
-                        open_p = float(t["o"])
-                        high_24h = float(t["h"][0])
-                        low_24h  = float(t["l"][0])
-                        vol_24h  = float(t["v"][0])
-                        change_pct = ((price - open_p) / open_p * 100) if open_p > 0 else 0
-                        return {
-                            "change_pct": round(change_pct, 2),
-                            "high_24h": high_24h,
-                            "low_24h": low_24h,
-                            "volume_24h": round(vol_24h, 2),
-                        }
+                        price = float(t["c"][0]); open_p = float(t["o"])
+                        chg = ((price-open_p)/open_p*100) if open_p else 0
+                        return {"change_pct": round(chg,2),
+                                "high_24h": float(t["h"][0]),
+                                "low_24h":  float(t["l"][0]),
+                                "volume":   float(t["v"][0])}
     except: pass
-
     # CoinGecko fallback
     try:
-        url = "https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd&include_24hr_change=true&include_24hr_vol=true&include_high_24h=true&include_low_24h=true"
+        url = "https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd&include_24hr_change=true&include_24hr_vol=true"
         async with aiohttp.ClientSession() as s:
             async with s.get(url, timeout=aiohttp.ClientTimeout(total=8)) as r:
                 if r.status == 200:
-                    d = await r.json()
-                    btc = d.get("bitcoin", {})
-                    return {
-                        "change_pct": round(btc.get("usd_24h_change", 0), 2),
-                        "high_24h": btc.get("usd_24h_high", 0) or 0,
-                        "low_24h":  btc.get("usd_24h_low", 0) or 0,
-                        "volume_24h": btc.get("usd_24h_vol", 0) or 0,
-                    }
+                    d = (await r.json()).get("bitcoin",{})
+                    return {"change_pct": round(d.get("usd_24h_change",0),2),
+                            "high_24h": 0, "low_24h": 0, "volume": 0}
     except: pass
+    return {"change_pct": 0, "high_24h": 0, "low_24h": 0, "volume": 0}
 
-    return {"change_pct": 0, "high_24h": 0, "low_24h": 0, "volume_24h": 0}
-
-# ─── POLYMARKET SENTIMENT ──────────────────────────────────────────────────
-async def fetch_poly_btc_sentiment():
-    """
-    Récupère le sentiment du marché Polymarket BTC UP/DOWN.
-    Si 80% parient DOWN → signal fort DOWN (et vice versa).
-    """
-    try:
-        # Chercher marchés BTC actifs
-        async with aiohttp.ClientSession() as s:
-            async with s.get(
-                "https://clob.polymarket.com/markets",
-                params={"active": "true", "closed": "false", "limit": "100"},
-                timeout=aiohttp.ClientTimeout(total=10)
-            ) as r:
-                if r.status != 200:
-                    return None
-                data = await r.json()
-                markets = data.get("data", []) if isinstance(data, dict) else data
-
-        # Filtrer marchés BTC UP/DOWN 5min
-        btc_markets = []
-        for m in markets:
-            if not isinstance(m, dict): continue
-            q = m.get("question", "").lower()
-            desc = m.get("description", "").lower()
-            if ("bitcoin" in q or "btc" in q) and ("up" in q or "down" in q or "higher" in q or "lower" in q):
-                btc_markets.append(m)
-
-        if not btc_markets:
-            return None
-
-        # Prendre le marché le plus récent avec volume
-        market = btc_markets[0]
-        tokens = market.get("tokens", [])
-        
-        if len(tokens) < 2:
-            return None
-
-        # Trouver UP et DOWN
-        up_price = down_price = None
-        for token in tokens:
-            outcome = token.get("outcome", "").upper()
-            price = float(token.get("price", 0.5))
-            if "UP" in outcome or "YES" in outcome or "HIGHER" in outcome:
-                up_price = price
-            elif "DOWN" in outcome or "NO" in outcome or "LOWER" in outcome:
-                down_price = price
-
-        if up_price is None or down_price is None:
-            # Fallback: premier token = UP, deuxième = DOWN
-            up_price   = float(tokens[0].get("price", 0.5))
-            down_price = float(tokens[1].get("price", 0.5))
-
-        # Sentiment: prix = probabilité implicite
-        # up_price = 0.30 signifie 30% de chance UP → marché pense DOWN
-        up_pct   = round(up_price   * 100, 1)
-        down_pct = round(down_price * 100, 1)
-
-        # Signal fort si déséquilibre > 65/35
-        bias = None
-        if up_pct >= 65:   bias = "UP"
-        elif down_pct >= 65: bias = "DOWN"
-
-        return {
-            "up_pct":    up_pct,
-            "down_pct":  down_pct,
-            "bias":       bias,
-            "market_q":  market.get("question", "")[:60],
-            "confidence": max(up_pct, down_pct),
-        }
-
-    except Exception as e:
-        log.warning(f"Poly sentiment: {e}")
-        return None
-
-# ─── CLAUDE AI BRAIN v6 ────────────────────────────────────────────────────
-async def claude_decide(ind_1m, ind_5m, ind_15m, ind_1h, recent_trades, poly_sentiment,
-                        bankroll, consec_losses, fear_greed, btc_24h, session):
+# ─── CLAUDE AI v7 ──────────────────────────────────────────────────────────
+async def claude_decide(i1, i5, i15, i1h, trades, bankroll, consec, fg, btc24, sess):
     if not ANTHROPIC_KEY:
-        return {"dir": None, "confidence": 0, "bet_size": 0,
-                "reasoning": "Pas de clé API Claude.", "trade": False}
+        return {"dir":None,"conf":0,"size":0,"reasoning":"Pas de clé API.","trade":False}
 
-    # Polymarket sentiment string
-    if poly_sentiment:
-        poly_str = (f"UP: {poly_sentiment['up_pct']}% | DOWN: {poly_sentiment['down_pct']}% | "
-                   f"Biais marché: {poly_sentiment['bias'] or 'NEUTRE'} | "
-                   f"Marché: {poly_sentiment['market_q']}")
-    else:
-        poly_str = "Données Polymarket non disponibles — se baser sur TF uniquement."
+    patterns = pattern_mem(trades)
+    trades_txt = "".join(f"  {t['result']} {t['dir']} PnL:{t['pnl']:+.2f}$ conf:{t.get('conf',0)*100:.0f}%\n"
+                         for t in trades[-6:]) or "  Aucun trade.\n"
 
-    # Pattern memory
-    pattern_analysis = analyze_patterns(recent_trades) if len(recent_trades) >= 5 else "Moins de 5 trades — pas encore de pattern."
+    sup_str = str(i5.get("supports",[])) or "Aucun"
+    res_str = str(i5.get("resistances",[])) or "Aucun"
+    max_bet = round(min(MAX_BET_USD, bankroll*MAX_BET_PCT), 2)
+    mid_bet = round(MIN_BET_USD + (max_bet-MIN_BET_USD)*0.5, 2)
 
-    # Résumé trades récents
-    trades_summary = ""
-    for t in recent_trades[-8:]:
-        ts = datetime.fromtimestamp(t["ts"]).strftime("%H:%M")
-        trades_summary += f"- {t['result']} {t['dir']} | PnL:{t['pnl']:+.2f}$ | conf:{t.get('conf',0)*100:.0f}% | {ts}\n"
-    if not trades_summary: trades_summary = "Aucun trade."
+    prompt = f"""Tu es un expert en trading Polymarket BTC UP/DOWN 5 minutes.
+Objectif: maximiser le win rate. Trader uniquement les setups à haute probabilité.
 
-    # Support/Résistance
-    sup_str = str(ind_5m.get("supports",  [])) if ind_5m.get("supports")  else "Aucun détecté"
-    res_str = str(ind_5m.get("resistances",[])) if ind_5m.get("resistances") else "Aucun détecté"
+━━━ MACRO ━━━
+Fear&Greed: {fg['value']}/100 ({fg['label']})
+BTC 24h: {btc24['change_pct']:+.2f}% | High:{btc24['high_24h']:,.0f} Low:{btc24['low_24h']:,.0f}
+Session: {sess['session']} ({sess['quality']}) | Heure Paris: {(datetime.utcnow().hour+2)%24}h
 
-    prompt = f"""Tu es un expert en trading de prédiction binaire Polymarket (BTC UP/DOWN 5 minutes).
-Tu dois analyser TOUS les éléments et prendre la MEILLEURE décision possible.
+━━━ TENDANCE DOMINANTE (1H) ━━━
+EMA 1h: {'HAUSSIER' if i1h.get('ema_bull') else 'BAISSIER'}
+MACD 1h: {i1h.get('macd_hist',0):+.4f}
+RSI 1h: {i1h.get('rsi_14',50)}
+Momentum 1h: {i1h.get('momentum',0):+.2f}
+⚠️ La tendance 1h est le signal DOMINANT. Ne pas aller contre sans RSI extrême (<15 ou >85).
 
-═══════════════════════════════
-CONTEXTE MACRO
-═══════════════════════════════
-Fear & Greed Index: {fear_greed['value']}/100 ({fear_greed['label']})
-BTC 24h: {btc_24h['change_pct']:+.2f}% | High: ${btc_24h['high_24h']:,.0f} | Low: ${btc_24h['low_24h']:,.0f}
-Session actuelle: {session['session']} ({session['quality']})
-Heure Paris: {session['hour_paris']}h
+━━━ NIVEAUX CLÉS ━━━
+Prix: ${i5.get('price',0):,.2f}
+Supports: {sup_str} | Résistances: {res_str}
+VWAP 5m: ${i5.get('vwap',0):,.0f} ({'AU-DESSUS' if i5.get('above_vwap') else 'EN-DESSOUS'})
 
-TENDANCE COURT TERME (basée sur 1h klines):
-Prix actuel: ${ind_5m.get('price',0):,.2f}
-EMA 1h: {'HAUSSIER' if ind_1h.get('ema_bull') else 'BAISSIER'}
-MACD 1h: {ind_1h.get('macd_hist',0):+.4f}
-RSI 1h: {ind_1h.get('rsi_14',50)}
-Momentum 1h: {ind_1h.get('momentum',0):+.2f}
+━━━ INDICATEURS 5M (principal) ━━━
+RSI 7/14: {i5.get('rsi_7',50)}/{i5.get('rsi_14',50)}
+EMA 9/21/50: {i5.get('ema9',0):.0f}/{i5.get('ema21',0):.0f}/{i5.get('ema50',0):.0f} ({'↑' if i5.get('ema_bull') else '↓'})
+MACD: {i5.get('macd_hist',0):+.4f} | Stoch: {i5.get('stoch_k',50)}/{i5.get('stoch_d',50)}
+Williams %R: {i5.get('williams_r',-50)} | Vol ratio: x{i5.get('vol_ratio',1):.2f}
+ATR: ${i5.get('atr',0):.0f} ({i5.get('atr_pct',0):.3f}%)
 
-⚠️ RÈGLE CRITIQUE: La tendance 1h EST PLUS FIABLE que la tendance 24h pour trader 5min.
-- Si EMA 1h BAISSIER + MACD 1h négatif → tendance court terme BAISSIÈRE → favoriser DOWN
-- Si EMA 1h HAUSSIER + MACD 1h positif → tendance court terme HAUSSIÈRE → favoriser UP
-- Ne jamais aller CONTRE la tendance 1h sauf RSI extrême (< 15 ou > 85) sur 5m
+━━━ 1M / 15M / 1H ━━━
+1m  RSI:{i1.get('rsi_14',50)} EMA:{'↑' if i1.get('ema_bull') else '↓'} MACD:{i1.get('macd_hist',0):+.3f} Vol:x{i1.get('vol_ratio',1):.1f}
+15m RSI:{i15.get('rsi_14',50)} EMA:{'↑' if i15.get('ema_bull') else '↓'} MACD:{i15.get('macd_hist',0):+.3f} Mom:{i15.get('momentum',0):+.0f}
+1h  RSI:{i1h.get('rsi_14',50)} EMA:{'↑' if i1h.get('ema_bull') else '↓'} MACD:{i1h.get('macd_hist',0):+.2f}
 
-═══════════════════════════════
-SENTIMENT POLYMARKET (CRUCIAL)
-═══════════════════════════════
-{poly_str}
-
-⚡ Le sentiment Polymarket = signal bonus très utile MAIS OPTIONNEL.
-- Si disponible et biais fort (75%+) → accorde-lui du poids supplémentaire
-- Si NON DISPONIBLE → ignore complètement et base-toi sur les indicateurs techniques
-- Ne PAS refuser de trader uniquement parce que Poly est indisponible
-- Les indicateurs techniques seuls sont suffisants pour décider
-
-═══════════════════════════════
-PRIX & NIVEAUX CLÉS
-═══════════════════════════════
-Prix actuel: ${ind_5m.get('price',0):,.2f}
-Supports proches: {sup_str}
-Résistances proches: {res_str}
-VWAP 5m: ${ind_5m.get('vwap',0):,.0f} ({'AU-DESSUS' if ind_5m.get('above_vwap') else 'EN-DESSOUS'})
-
-═══════════════════════════════
-INDICATEURS TECHNIQUES
-═══════════════════════════════
-── 1 MINUTE ──
-RSI: {ind_1m.get('rsi_14',50)} | Stoch K/D: {ind_1m.get('stoch_k',50)}/{ind_1m.get('stoch_d',50)}
-EMA9/21: {'HAUSSIER' if ind_1m.get('ema_bull') else 'BAISSIER'} | MACD: {ind_1m.get('macd_hist',0):.4f}
-Williams %R: {ind_1m.get('williams_r',-50)} | Vol ratio: x{ind_1m.get('vol_ratio',1):.2f}
-Momentum: {ind_1m.get('momentum',0):+.2f}
-
-── 5 MINUTES (principal) ──
-RSI 7/14: {ind_5m.get('rsi_7',50)}/{ind_5m.get('rsi_14',50)}
-EMA9/21/50: {ind_5m.get('ema9',0):.0f}/{ind_5m.get('ema21',0):.0f}/{ind_5m.get('ema50',0):.0f} ({'HAUSSIER' if ind_5m.get('ema_bull') else 'BAISSIER'})
-MACD hist: {ind_5m.get('macd_hist',0):.4f}
-Bollinger: {ind_5m.get('bb_low',0):.0f} / {ind_5m.get('bb_mid',0):.0f} / {ind_5m.get('bb_high',0):.0f}
-Stoch: {ind_5m.get('stoch_k',50)}/{ind_5m.get('stoch_d',50)} | Williams: {ind_5m.get('williams_r',-50)}
-ATR: ${ind_5m.get('atr',0):.0f} ({ind_5m.get('atr_pct',0):.3f}%)
-
-── 15 MINUTES ──
-RSI: {ind_15m.get('rsi_14',50)} | EMA: {'HAUSSIER' if ind_15m.get('ema_bull') else 'BAISSIER'}
-MACD: {ind_15m.get('macd_hist',0):.4f} | Momentum: {ind_15m.get('momentum',0):+.2f}
-
-── 1 HEURE (tendance long terme) ──
-RSI: {ind_1h.get('rsi_14',50)} | EMA: {'HAUSSIER' if ind_1h.get('ema_bull') else 'BAISSIER'}
-MACD: {ind_1h.get('macd_hist',0):.4f} | Momentum: {ind_1h.get('momentum',0):+.2f}
-
-═══════════════════════════════
-MÉMOIRE & PATTERNS
-═══════════════════════════════
-{pattern_analysis}
-
+━━━ MÉMOIRE ━━━
+{patterns}
 Derniers trades:
-{trades_summary}
-Pertes consécutives: {consec_losses}
-Bankroll: {bankroll:.2f} USDC
+{trades_txt}Pertes consécutives: {consec} | Bankroll: {bankroll:.2f}$
 
-═══════════════════════════════
-RÈGLES DE DÉCISION
-═══════════════════════════════
-OBJECTIF: Maximiser le win rate. Suivre la tendance dominante.
+━━━ RÈGLES ━━━
+1. SUIVRE tendance 1h sauf RSI 5m < 15 (UP) ou > 85 (DOWN)
+2. Signal FORT (mise max {max_bet}$): 3+ TF alignés + volume x>1.3 + session EXCELLENT
+3. Signal MOYEN (mise {mid_bet}$): 2 TF alignés dans sens 1h + session GOOD+
+4. PASS si: ATR < 0.04% | tous TF contradictoires | prix exactement sur S/R
+5. Fear&Greed < 15 en tendance NEUTRE → biais UP | > 80 → biais DOWN
+6. Après 2 pertes → mise minimum {MIN_BET_USD}$ seulement
+7. Session US_OPEN/US_AFTERNOON → bonus confiance
 
-RÈGLE FONDAMENTALE — TENDANCE MACRO:
-BTC 24h change: {btc_24h['change_pct']:+.2f}%
-- Si BTC < -1% sur 24h → tendance BAISSIÈRE → INTERDIRE bets UP sauf signal EXCEPTIONNEL (RSI < 15 + divergence confirmée sur 1h)
-- Si BTC > +1% sur 24h → tendance HAUSSIÈRE → INTERDIRE bets DOWN sauf signal EXCEPTIONNEL (RSI > 85 + divergence confirmée)
-- Si BTC entre -1% et +1% → marché neutre → suivre les indicateurs normalement
-⚠️ UN RSI SURVENDU EN TENDANCE BAISSIÈRE NE SIGNIFIE PAS REBOND — ça peut rester survendu longtemps!
-
-STRATÉGIE HAUTE PROBABILITÉ:
-1. Signal FORT (trader avec mise normale):
-   - 3+ timeframes alignés dans la même direction QUE LA TENDANCE MACRO
-   - MACD confirme sur au moins 2 TF
-   - Volume ratio > 1.2
-
-2. Signal MOYEN (trader avec mise réduite 50%):
-   - 2 timeframes alignés dans la direction de la tendance
-   - Session EXCELLENT ou GOOD uniquement
-   - RSI confirme (< 40 pour UP en tendance haussière, > 60 pour DOWN en tendance baissière)
-
-3. NE PAS TRADER si:
-   - Signal CONTRE la tendance macro sans confirmation exceptionnelle
-   - ATR < 0.05% (marché mort)
-   - Prix exactement sur S/R sans direction claire
-   - 3 pertes consécutives → pause 1 tick
-
-4. RÈGLES AVANCÉES:
-   - Fear&Greed < 15 EN TENDANCE NEUTRE → favoriser UP (rebond macro)
-   - Fear&Greed < 15 EN TENDANCE BAISSIÈRE → NE PAS aller UP (baisse peut continuer)
-   - Fear&Greed > 80 → favoriser DOWN
-   - Session US_OPEN/US_AFTERNOON → augmenter confiance 10%
-   - EMA 1h baissière = tendance forte → ne pas aller contre
-
-5. MISE:
-   - Signal FORT dans tendance: {min(MAX_BET_USD, bankroll*MAX_BET_PCT):.2f}$ max
-   - Signal MOYEN: {MIN_BET_USD + (min(MAX_BET_USD, bankroll*MAX_BET_PCT)-MIN_BET_USD)*0.5:.2f}$
-   - Après 2 pertes: {MIN_BET_USD}$ minimum seulement
-   - Contre-tendance: {MIN_BET_USD}$ max même si signal fort
-
-RÉPONDS UNIQUEMENT EN JSON:
-{{
-  "trade": true/false,
-  "direction": "UP" ou "DOWN" ou null,
-  "confidence": 0.0-1.0,
-  "bet_size": montant USDC,
-  "reasoning": "Explication 2-3 phrases en français",
-  "key_signals": ["signal1", "signal2", "signal3", "signal4"],
-  "risk_level": "LOW" ou "MEDIUM" ou "HIGH",
-  "session_ok": true/false,
-  "main_concern": "principale préoccupation si pas de trade"
-}}"""
+RÉPONDS UNIQUEMENT EN JSON (rien d'autre):
+{{"trade":true/false,"direction":"UP"/"DOWN"/null,"confidence":0.0-1.0,"bet_size":{MIN_BET_USD}-{max_bet},"reasoning":"2-3 phrases FR","key_signals":["s1","s2","s3"],"risk_level":"LOW"/"MEDIUM"/"HIGH"}}"""
 
     try:
         async with aiohttp.ClientSession() as session_http:
             async with session_http.post(
                 CLAUDE_API,
                 headers={"Content-Type":"application/json",
-                         "x-api-key": ANTHROPIC_KEY,
+                         "x-api-key":ANTHROPIC_KEY,
                          "anthropic-version":"2023-06-01"},
-                json={"model":"claude-haiku-4-5-20251001",
-                      "max_tokens":600,
+                json={"model":"claude-haiku-4-5-20251001","max_tokens":400,
                       "messages":[{"role":"user","content":prompt}]},
                 timeout=aiohttp.ClientTimeout(total=25)
             ) as r:
                 if r.status != 200:
-                    log.error(f"Claude API {r.status}")
-                    return {"dir":None,"confidence":0,"bet_size":0,
-                            "reasoning":f"Erreur API ({r.status})","trade":False}
+                    txt = await r.text()
+                    log.error(f"Claude {r.status}: {txt[:100]}")
+                    return {"dir":None,"conf":0,"size":0,
+                            "reasoning":f"Erreur API {r.status}","trade":False}
                 data = await r.json()
                 raw  = data["content"][0]["text"].strip()
-                # Robust JSON extraction
-                raw = raw.replace("```json","").replace("```","").strip()
-                # Extract JSON object even if extra text around it
-                start = raw.find("{")
-                end   = raw.rfind("}") + 1
-                if start >= 0 and end > start:
-                    raw = raw[start:end]
-                res  = json.loads(raw)
-                def safe_float(val, default=0.0):
-                    try: return float(val) if val is not None else default
-                    except: return default
+                raw  = raw.replace("```json","").replace("```","").strip()
+                s = raw.find("{"); e = raw.rfind("}")+1
+                if s >= 0 and e > s: raw = raw[s:e]
+                res = json.loads(raw)
+
+                def sf(v, d=0.0):
+                    try: return float(v) if v is not None else d
+                    except: return d
 
                 direction = res.get("direction")
-                if direction not in ["UP", "DOWN"]: direction = None
+                if direction not in ["UP","DOWN"]: direction = None
+                trade = bool(res.get("trade",False)) and direction is not None
 
                 return {
-                    "dir":         direction,
-                    "confidence":  safe_float(res.get("confidence"), 0.0),
-                    "bet_size":    safe_float(res.get("bet_size"), 0.0),
-                    "reasoning":   str(res.get("reasoning","")),
-                    "key_signals": res.get("key_signals",[]) or [],
-                    "risk_level":  res.get("risk_level","MEDIUM") or "MEDIUM",
-                    "session_ok":  bool(res.get("session_ok", True)),
-                    "main_concern":str(res.get("main_concern","")),
-                    "trade":       bool(res.get("trade", False)) and direction is not None,
+                    "dir":       direction,
+                    "conf":      sf(res.get("confidence"), 0.0),
+                    "size":      sf(res.get("bet_size"), 0.0),
+                    "reasoning": str(res.get("reasoning","")),
+                    "signals":   res.get("key_signals",[]) or [],
+                    "risk":      res.get("risk_level","MEDIUM") or "MEDIUM",
+                    "trade":     trade,
                 }
     except Exception as e:
-        log.error(f"Claude: {e}")
-        return {"dir":None,"confidence":0,"bet_size":0,
-                "reasoning":f"Erreur: {str(e)[:80]}","trade":False}
+        log.error(f"Claude error: {e}")
+        return {"dir":None,"conf":0,"size":0,
+                "reasoning":f"Erreur: {str(e)[:60]}","trade":False}
 
 # ─── STATE ─────────────────────────────────────────────────────────────────
 class State:
     def __init__(self):
-        self.running          = False
-        self.paper_mode       = PAPER_MODE
-        self.bankroll         = BANKROLL_START
-        self.candles_1m       = deque(maxlen=100)
-        self.candles_5m       = deque(maxlen=100)
-        self.candles_15m      = deque(maxlen=100)
-        self.candles_1h       = deque(maxlen=100)
-        self.current_price    = 0.0
-        self.trades           = []
-        self.active_bet       = None
-        self.wins             = 0
-        self.losses           = 0
-        self.total_pnl        = 0.0
-        self.alerts           = True   # toujours True
-        self.daily_start_br   = BANKROLL_START
-        self.daily_reset_ts   = time.time()
-        self.streak           = 0
-        self.best_streak      = 0
-        self.worst_streak     = 0
-        self.consec_losses    = 0
-        self.cooldown_until   = 0
-        self.session_start    = time.time()
-        self.last_ai_decision = {}
-        self.skipped_trades   = 0
-        self.last_trade_dir   = None   # direction du dernier trade
-        self.last_trade_result= None   # WIN ou LOSS
-        self.last_trade_ts    = 0      # timestamp du dernier trade
-        self.fear_greed       = {"value": 50, "label": "Neutral"}
-        self.btc_24h          = {}
-        self.poly_sentiment   = None
-        self.tick_job         = None
-        self.price_job        = None
-        self.macro_job        = None
+        self.running       = False
+        self.paper_mode    = PAPER_MODE
+        self.bankroll      = BANKROLL_START
+        self.c1  = deque(maxlen=100)
+        self.c5  = deque(maxlen=100)
+        self.c15 = deque(maxlen=100)
+        self.c1h = deque(maxlen=100)
+        self.price         = 0.0
+        self.trades        = []
+        self.bet           = None        # active bet
+        self.wins = self.losses = 0
+        self.pnl           = 0.0
+        self.consec        = 0
+        self.streak        = 0
+        self.best_streak   = 0
+        self.worst_streak  = 0
+        self.cooldown_until= 0
+        self.session_start = time.time()
+        self.daily_start   = BANKROLL_START
+        self.daily_ts      = time.time()
+        self.skipped       = 0
+        self.last_decision = {}
+        self.fg            = {"value":50,"label":"Neutral"}
+        self.btc24         = {}
+        self.tick_job = self.price_job = self.macro_job = None
 
     def save(self):
         try:
-            with open(DATA_FILE, "w") as f:
+            with open(DATA_FILE,"w") as f:
                 json.dump({
-                    "bankroll": self.bankroll,
-                    "trades": self.trades[-200:],
-                    "wins": self.wins, "losses": self.losses,
-                    "total_pnl": self.total_pnl,
-                    "best_streak": self.best_streak,
-                    "worst_streak": self.worst_streak,
-                    "consec_losses": self.consec_losses,
-                    "daily_start_br": self.daily_start_br,
-                    "daily_reset_ts": self.daily_reset_ts,
-                    "paper_mode": self.paper_mode,
-                    "skipped_trades": self.skipped_trades,
+                    "bankroll":self.bankroll,"trades":self.trades[-200:],
+                    "wins":self.wins,"losses":self.losses,"pnl":self.pnl,
+                    "best_streak":self.best_streak,"worst_streak":self.worst_streak,
+                    "consec":self.consec,"daily_start":self.daily_start,
+                    "daily_ts":self.daily_ts,"paper_mode":self.paper_mode,
+                    "skipped":self.skipped,
                 }, f, indent=2)
         except Exception as e: log.error(f"Save: {e}")
 
@@ -747,469 +435,445 @@ class State:
         try:
             if os.path.exists(DATA_FILE):
                 with open(DATA_FILE) as f: d = json.load(f)
-                self.bankroll       = d.get("bankroll", BANKROLL_START)
-                self.trades         = d.get("trades", [])
-                self.wins           = d.get("wins", 0)
-                self.losses         = d.get("losses", 0)
-                self.total_pnl      = d.get("total_pnl", 0.0)
-                self.best_streak    = d.get("best_streak", 0)
-                self.worst_streak   = d.get("worst_streak", 0)
-                self.consec_losses  = d.get("consec_losses", 0)
-                self.daily_start_br = d.get("daily_start_br", self.bankroll)
-                self.daily_reset_ts = d.get("daily_reset_ts", time.time())
-                self.paper_mode     = d.get("paper_mode", PAPER_MODE)
-                self.skipped_trades = d.get("skipped_trades", 0)
+                self.bankroll     = d.get("bankroll", BANKROLL_START)
+                self.trades       = d.get("trades", [])
+                self.wins         = d.get("wins", 0)
+                self.losses       = d.get("losses", 0)
+                self.pnl          = d.get("pnl", 0.0)
+                self.best_streak  = d.get("best_streak", 0)
+                self.worst_streak = d.get("worst_streak", 0)
+                self.consec       = d.get("consec", 0)
+                self.daily_start  = d.get("daily_start", self.bankroll)
+                self.daily_ts     = d.get("daily_ts", time.time())
+                self.paper_mode   = d.get("paper_mode", PAPER_MODE)
+                self.skipped      = d.get("skipped", 0)
                 log.info("State chargé")
         except Exception as e: log.error(f"Load: {e}")
 
 st = State()
 
 # ─── RISK ──────────────────────────────────────────────────────────────────
-def check_daily_limit():
+def check_daily():
     now = time.time()
-    if now - st.daily_reset_ts > 86400:
-        st.daily_start_br = st.bankroll
-        st.daily_reset_ts = now
-    if st.daily_start_br == 0: return False
-    return (st.daily_start_br - st.bankroll) / st.daily_start_br >= DAILY_LOSS_MAX
+    if now - st.daily_ts > 86400:
+        st.daily_start = st.bankroll
+        st.daily_ts = now
+    return st.daily_start > 0 and (st.daily_start-st.bankroll)/st.daily_start >= DAILY_LOSS_MAX
 
-def in_cooldown(): return time.time() < st.cooldown_until
+def in_cd(): return time.time() < st.cooldown_until
+
+# ─── SEND HELPER — jamais de crash ─────────────────────────────────────────
+async def send(bot, text, parse_mode="Markdown"):
+    """Envoie un message Telegram — jamais de crash."""
+    try:
+        await bot.send_message(chat_id=ALLOWED_UID, text=text, parse_mode=parse_mode)
+        return True
+    except Exception as e:
+        log.error(f"Send failed: {e}")
+        # Retry without markdown
+        try:
+            clean = text.replace("*","").replace("`","").replace("_","")
+            await bot.send_message(chat_id=ALLOWED_UID, text=clean)
+            return True
+        except Exception as e2:
+            log.error(f"Send retry failed: {e2}")
+            return False
 
 # ─── JOBS ──────────────────────────────────────────────────────────────────
-async def price_update(context):
+async def job_price(context):
     p = await fetch_price()
-    if p > 0: st.current_price = p
+    if p > 0: st.price = p
 
-async def macro_update(context):
-    """Met à jour Fear&Greed, données 24h et sentiment Polymarket toutes les 5 min"""
-    st.fear_greed     = await fetch_fear_greed()
-    st.btc_24h        = await fetch_btc_24h()
-    st.poly_sentiment = await fetch_poly_btc_sentiment()
-    poly_str = f"Poly={st.poly_sentiment['bias']} {st.poly_sentiment['confidence']:.0f}%" if st.poly_sentiment else "Poly=N/A"
-    log.info(f"Macro: F&G={st.fear_greed['value']} BTC24h={st.btc_24h.get('change_pct',0):+.2f}% {poly_str}")
+async def job_macro(context):
+    st.fg    = await fetch_fear_greed()
+    st.btc24 = await fetch_btc_24h()
+    log.info(f"Macro: F&G={st.fg['value']} BTC24h={st.btc24.get('change_pct',0):+.2f}%")
 
-async def tick(context: ContextTypes.DEFAULT_TYPE):
+async def job_tick(context):
     if not st.running: return
-    if check_daily_limit():
+
+    # Daily limit
+    if check_daily():
         st.running = False
-        await context.bot.send_message(chat_id=ALLOWED_UID,
-            text="🛑 *Limite journalière atteinte* — Bot arrêté.", parse_mode="Markdown")
-        return
-    if in_cooldown():
-        log.info(f"Cooldown {int((st.cooldown_until-time.time())/60)}min")
+        await send(context.bot, "🛑 *Limite journalière atteinte* — Bot arrêté.")
         return
 
-    # Fetch 4 timeframes
+    # Cooldown
+    if in_cd():
+        rem = int((st.cooldown_until - time.time())/60)
+        log.info(f"Cooldown {rem}min restantes")
+        return
+
+    # Fetch data
     c1  = await fetch_klines("1m",  60)
     c5  = await fetch_klines("5m",  50)
     c15 = await fetch_klines("15m", 40)
     c1h = await fetch_klines("1h",  30)
 
-    if not c5: log.warning("Pas de données"); return
+    if not c5:
+        log.warning("Pas de données klines")
+        return
 
-    st.candles_1m  = deque(c1,  maxlen=100)
-    st.candles_5m  = deque(c5,  maxlen=100)
-    st.candles_15m = deque(c15, maxlen=100)
-    st.candles_1h  = deque(c1h, maxlen=100)
-    st.current_price = c5[-1]["close"]
+    st.c1  = deque(c1,  maxlen=100)
+    st.c5  = deque(c5,  maxlen=100)
+    st.c15 = deque(c15, maxlen=100)
+    st.c1h = deque(c1h, maxlen=100)
+    st.price = c5[-1]["close"]
 
-    # Résoudre bet actif
-    if st.active_bet:
-        bet   = st.active_bet
-        won   = bet["dir"] == ("UP" if st.current_price > bet["entry_price"] else "DOWN")
-        gross = bet["amount"] * (1-POLY_FEE) if won else -bet["amount"]
+    # ── RÉSOUDRE BET ACTIF ──
+    if st.bet:
+        bet  = st.bet
+        won  = bet["dir"] == ("UP" if st.price > bet["entry"] else "DOWN")
+        gross = bet["amount"]*(1-POLY_FEE) if won else -bet["amount"]
 
-        st.bankroll   = max(0.0, st.bankroll + gross)
-        st.total_pnl += gross
+        st.bankroll  = max(0.0, st.bankroll + gross)
+        st.pnl      += gross
 
         if won:
-            st.wins += 1; st.consec_losses = 0
+            st.wins += 1; st.consec = 0
             st.streak = st.streak+1 if st.streak >= 0 else 1
             st.best_streak = max(st.best_streak, st.streak)
         else:
-            st.losses += 1; st.consec_losses += 1
+            st.losses += 1; st.consec += 1
             st.streak = st.streak-1 if st.streak <= 0 else -1
             st.worst_streak = min(st.worst_streak, st.streak)
-            if st.consec_losses >= MAX_CONSEC_LOSS:
+            if st.consec >= MAX_CONSEC_LOSS:
                 st.cooldown_until = time.time() + COOLDOWN_MIN*60
+                log.warning(f"Cooldown activé ({st.consec} pertes)")
 
-        record = {"dir":bet["dir"],"amount":bet["amount"],"pnl":round(gross,4),
-                  "conf":bet["conf"],"result":"WIN" if won else "LOSS",
-                  "entry":bet["entry_price"],"exit":st.current_price,
-                  "ai_reasoning":bet.get("ai_reasoning",""),
-                  "paper":st.paper_mode,"ts":int(time.time())}
+        record = {
+            "dir":bet["dir"],"amount":bet["amount"],"pnl":round(gross,4),
+            "conf":bet["conf"],"result":"WIN" if won else "LOSS",
+            "entry":bet["entry"],"exit":st.price,
+            "reasoning":bet.get("reasoning",""),
+            "paper":st.paper_mode,"ts":int(time.time())
+        }
         st.trades.append(record)
-        st.last_trade_dir    = bet["dir"]
-        st.last_trade_result = "WIN" if won else "LOSS"
-        st.last_trade_ts     = time.time()
-        st.active_bet = None
+        st.bet = None
 
-        # Toujours notifier — try/catch pour éviter crash
-        try:
-            emoji = "✅" if won else "❌"
-            cd_msg = f"\n⏸ Cooldown {COOLDOWN_MIN}min" if in_cooldown() else ""
-            mode_tag = "📄" if st.paper_mode else "💰"
-            dir_tag = bet["dir"]
-            entry_p = bet["entry_price"]
-            exit_p = st.current_price
-            pnl_sign = "+" if gross >= 0 else ""
-            await context.bot.send_message(
-                chat_id=ALLOWED_UID,
-                text=(
-                    f"{emoji} *Trade clôturé* [{mode_tag}]\n"
-                    f"`{dir_tag}` | `${entry_p:,.0f}` → `${exit_p:,.0f}`\n"
-                    f"PnL: `{pnl_sign}{gross:.2f} USDC` | Bankroll: `{st.bankroll:.2f}`\n"
-                    f"Streak: `{st.streak:+d}` | Pertes: `{st.consec_losses}`{cd_msg}"
-                ),
-                parse_mode="Markdown"
-            )
-        except Exception as notif_err:
-            log.error(f"Notification erreur: {notif_err}")
+        # Notification clôture — TOUJOURS envoyée
+        emoji = "✅" if won else "❌"
+        mode  = "📄" if st.paper_mode else "💰"
+        cd_msg = f"\n⏸ Cooldown {COOLDOWN_MIN}min" if in_cd() else ""
+        msg = (f"{emoji} *Trade clôturé* [{mode}]\n"
+               f"`{bet['dir']}` | `${bet['entry']:,.0f}` → `${st.price:,.0f}`\n"
+               f"PnL: `{'+' if gross>=0 else ''}{gross:.2f} USDC`\n"
+               f"Bankroll: `{st.bankroll:.2f} USDC`\n"
+               f"Streak: `{st.streak:+d}` | Pertes: `{st.consec}`{cd_msg}")
+        await send(context.bot, msg)
         st.save()
 
-    if in_cooldown(): return
+    if in_cd(): return
+
+    # Trend filter
+    if not is_trending(list(st.c5), list(st.c15)):
+        st.skipped += 1
+        log.info("Range — pause")
+        return
 
     # Indicateurs
-    ind_1m  = compute_indicators(list(st.candles_1m))
-    ind_5m  = compute_indicators(list(st.candles_5m))
-    ind_15m = compute_indicators(list(st.candles_15m))
-    ind_1h  = compute_indicators(list(st.candles_1h))
-    session = get_session_context()
+    i1  = compute_ind(list(st.c1))
+    i5  = compute_ind(list(st.c5))
+    i15 = compute_ind(list(st.c15))
+    i1h = compute_ind(list(st.c1h))
+    sess = session_ctx()
 
-    if not ind_5m: return
+    if not i5: return
 
-    # Filtre tendance — pause si marché en range
-    if not is_trending_market(list(st.candles_5m), list(st.candles_15m)):
-        st.skipped_trades += 1
-        log.info("Marché en range — pause automatique")
-        return
+    # Claude décide
+    dec = await claude_decide(i1, i5, i15, i1h, st.trades[-15:],
+                              st.bankroll, st.consec, st.fg, st.btc24, sess)
+    st.last_decision = dec
 
-    # Filtre pertes consécutives — cooldown forcé après 2 pertes
-    now = time.time()
-    if st.last_trade_result == "LOSS" and st.consec_losses >= 2 and (now - st.last_trade_ts) < 300:
-        log.info(f"2 pertes consécutives — cooldown forcé 30min")
-        st.cooldown_until = time.time() + COOLDOWN_MIN * 60
-        return
+    log.info(f"Claude: {dec['dir']} trade={dec['trade']} conf={dec['conf']:.0%} | {dec['reasoning'][:60]}")
 
-    # Claude AI décide
-    decision = await claude_decide(
-        ind_1m, ind_5m, ind_15m, ind_1h,
-        st.trades[-15:], st.poly_sentiment, st.bankroll, st.consec_losses,
-        st.fear_greed, st.btc_24h, session
-    )
-    st.last_ai_decision = decision
-
-    if decision["trade"] and decision["dir"] and not st.active_bet:
-        amount = max(MIN_BET_USD, min(decision["bet_size"], MAX_BET_USD, st.bankroll*MAX_BET_PCT))
+    # Placer bet
+    if dec["trade"] and dec["dir"] and not st.bet:
+        amount = max(MIN_BET_USD, min(dec["size"], MAX_BET_USD, st.bankroll*MAX_BET_PCT))
         amount = round(amount, 2)
+
         if amount >= MIN_BET_USD and st.bankroll >= amount:
-            st.active_bet = {
-                "dir": decision["dir"], "amount": amount,
-                "conf": decision["confidence"],
-                "entry_price": st.current_price,
-                "ai_reasoning": decision["reasoning"],
+            st.bet = {
+                "dir": dec["dir"], "amount": amount, "conf": dec["conf"],
+                "entry": st.price, "reasoning": dec["reasoning"],
                 "ts": int(time.time()),
             }
-            if st.alerts:
-                risk_e = {"LOW":"🟢","MEDIUM":"🟡","HIGH":"🔴"}.get(decision.get("risk_level","MEDIUM"),"🟡")
-                sig_txt = "\n".join(f"  • {s}" for s in decision.get("key_signals",[])[:4])
-                await context.bot.send_message(chat_id=ALLOWED_UID,
-                    text=(f"🧠 *Claude AI Bet* [{'📄' if st.paper_mode else '💰'}]\n"
-                          f"━━━━━━━━━━━━━━━━━\n"
-                          f"*{decision['dir']}* | `{amount:.2f}$` | `{decision['confidence']*100:.0f}%` | {risk_e}\n"
-                          f"BTC: `${st.current_price:,.2f}` | Session: `{session['session']}`\n"
-                          f"F&G: `{st.fear_greed['value']}` ({st.fear_greed['label']})\n\n"
-                          f"💭 _{decision['reasoning']}_\n\n"
-                          f"🔑 Signaux:\n{sig_txt}"),
-                    parse_mode="Markdown")
+
+            # Notification bet — TOUJOURS envoyée
+            mode = "📄" if st.paper_mode else "💰"
+            risk_e = {"LOW":"🟢","MEDIUM":"🟡","HIGH":"🔴"}.get(dec["risk"],"🟡")
+            sigs = "\n".join(f"  • {s}" for s in dec["signals"][:4])
+            msg = (f"🧠 *Bet placé* [{mode}]\n"
+                   f"━━━━━━━━━━━━━━━\n"
+                   f"*{dec['dir']}* | `{amount:.2f}$` | `{dec['conf']*100:.0f}%` | {risk_e}\n"
+                   f"BTC: `${st.price:,.2f}` | `{sess['session']}`\n"
+                   f"F&G: `{st.fg['value']}` | 1h: `{'↑' if i1h.get('ema_bull') else '↓'}`\n\n"
+                   f"💭 _{dec['reasoning']}_\n\n"
+                   f"🔑 Signaux:\n{sigs}")
+            await send(context.bot, msg)
     else:
-        st.skipped_trades += 1
-        log.info(f"PASS: {decision.get('main_concern','') or decision.get('reasoning','')[:80]}")
+        st.skipped += 1
 
 # ─── HELPERS ───────────────────────────────────────────────────────────────
 def auth(u): return ALLOWED_UID == 0 or u.effective_user.id == ALLOWED_UID
-def fmt(v): return f"+{v:.2f}" if v >= 0 else f"{v:.2f}"
-def uptime():
-    s = int(time.time() - st.session_start)
-    return f"{s//3600:02d}:{(s%3600)//60:02d}:{s%60:02d}"
-def win_rate():
+def fmt(v):  return f"+{v:.2f}" if v >= 0 else f"{v:.2f}"
+def wr():
     t = st.wins + st.losses
-    return f"{st.wins/t*100:.1f}%" if t > 0 else "—"
+    return f"{st.wins/t*100:.1f}%" if t else "—"
 def roi():
-    r = (st.bankroll - BANKROLL_START) / BANKROLL_START * 100
-    return f"{fmt(r)}%"
+    return f"{fmt((st.bankroll-BANKROLL_START)/BANKROLL_START*100)}%"
+def upt():
+    s = int(time.time()-st.session_start)
+    return f"{s//3600:02d}:{(s%3600)//60:02d}:{s%60:02d}"
 
-def main_kb():
+def kb():
+    sess = session_ctx()
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📊 Status",    callback_data="status"),
-         InlineKeyboardButton("🧠 AI Last",   callback_data="ai_last")],
-        [InlineKeyboardButton("📈 Trades",    callback_data="trades"),
-         InlineKeyboardButton("📉 Stats",     callback_data="stats")],
-        [InlineKeyboardButton("😱 Fear&Greed",callback_data="fear"),
-         InlineKeyboardButton("🕐 Session",   callback_data="session")],
-        [InlineKeyboardButton("▶️ Start",     callback_data="run"),
-         InlineKeyboardButton("⏹ Stop",      callback_data="stop")],
+        [InlineKeyboardButton("📊 Status",   callback_data="status"),
+         InlineKeyboardButton("🧠 AI Last",  callback_data="ai")],
+        [InlineKeyboardButton("📈 Trades",   callback_data="trades"),
+         InlineKeyboardButton("📉 Stats",    callback_data="stats")],
+        [InlineKeyboardButton("😱 F&G",      callback_data="fear"),
+         InlineKeyboardButton(f"🕐 {sess['session']}", callback_data="session")],
+        [InlineKeyboardButton("▶️ Start",    callback_data="run"),
+         InlineKeyboardButton("⏹ Stop",     callback_data="stop")],
         [InlineKeyboardButton("🟢 Actif" if st.running else "🔴 Arrêté", callback_data="status"),
-         InlineKeyboardButton("💰 Passer Réel" if st.paper_mode else "📄 Paper", callback_data="toggle_paper")],
+         InlineKeyboardButton("💰 Réel" if st.paper_mode else "📄 Paper", callback_data="paper")],
     ])
 
 # ─── COMMANDES ─────────────────────────────────────────────────────────────
-async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def cmd_start(update: Update, context):
     if not auth(update): return
-    session = get_session_context()
+    sess = session_ctx()
     await update.message.reply_text(
-        f"🧠 *POLYMARKET BOT v6 — AI ENHANCED*\n"
+        f"🧠 *POLYMARKET BOT v7 — FINAL*\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"Mode: *{'📄 PAPER' if st.paper_mode else '💰 RÉEL'}*\n\n"
+        f"✅ Notifications garanties\n"
         f"✅ 4 timeframes (1m/5m/15m/1h)\n"
-        f"✅ Fear & Greed Index\n"
-        f"✅ Sessions de trading\n"
+        f"✅ Tendance 1h comme signal dominant\n"
+        f"✅ Fear&Greed + Sessions\n"
         f"✅ Support/Résistance\n"
-        f"✅ Mémoire des patterns\n"
-        f"✅ Contexte macro 24h\n\n"
-        f"Session: `{session['session']}` — {session['quality']}\n\n"
+        f"✅ Cooldown intelligent\n\n"
+        f"Session: `{sess['session']}` — {sess['quality']}\n\n"
         f"*/run* */stop* */status* */ai* */signal*\n"
-        f"*/trades* */stats* */fear* */session* */reset*",
-        parse_mode="Markdown", reply_markup=main_kb()
+        f"*/trades* */stats* */fear* */paper* */reset*",
+        parse_mode="Markdown", reply_markup=kb()
     )
 
-async def cmd_run(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def cmd_run(update: Update, context):
     if not auth(update): return
     if st.running:
         await update.message.reply_text("⚠️ Déjà en cours.")
         return
     if not ANTHROPIC_KEY:
-        await update.message.reply_text("❌ ANTHROPIC_API_KEY manquante dans Railway.")
+        await update.message.reply_text("❌ ANTHROPIC_API_KEY manquante.")
         return
 
     st.running = True
     st.session_start = time.time()
-    st.daily_start_br = st.bankroll
+    st.daily_start = st.bankroll
+    st.daily_ts = time.time()
 
-    st.price_job = context.job_queue.run_repeating(price_update, interval=30,   first=5)
-    st.macro_job = context.job_queue.run_repeating(macro_update, interval=300,  first=10)
-    st.tick_job  = context.job_queue.run_repeating(tick,         interval=300,  first=15)
+    st.price_job = context.job_queue.run_repeating(job_price, interval=30,  first=5)
+    st.macro_job = context.job_queue.run_repeating(job_macro, interval=300, first=8)
+    st.tick_job  = context.job_queue.run_repeating(job_tick,  interval=300, first=15)
 
-    # Fetch macro immédiat
-    st.fear_greed     = await fetch_fear_greed()
-    st.btc_24h        = await fetch_btc_24h()
-    st.poly_sentiment = await fetch_poly_btc_sentiment()
-    session           = get_session_context()
+    st.fg    = await fetch_fear_greed()
+    st.btc24 = await fetch_btc_24h()
+    sess = session_ctx()
 
     await update.message.reply_text(
-        f"▶️ *Bot v6 AI démarré !*\n"
-        f"F&G: `{st.fear_greed['value']}` ({st.fear_greed['label']})\n"
-        f"BTC 24h: `{st.btc_24h.get('change_pct',0):+.2f}%`\n"
-        f"Session: `{session['session']}` — {session['quality']}\n"
+        f"▶️ *Bot v7 démarré !*\n"
+        f"F&G: `{st.fg['value']}` ({st.fg['label']})\n"
+        f"BTC 24h: `{st.btc24.get('change_pct',0):+.2f}%`\n"
+        f"Session: `{sess['session']}` — {sess['quality']}\n"
         f"Bankroll: `{st.bankroll:.2f} USDC`",
         parse_mode="Markdown"
     )
-    await tick(context)
+    await job_tick(context)
 
-async def cmd_stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def cmd_stop(update: Update, context):
     if not auth(update): return
     st.running = False
     for j in [st.tick_job, st.price_job, st.macro_job]:
-        if j: j.schedule_removal()
+        if j:
+            try: j.schedule_removal()
+            except: pass
     st.tick_job = st.price_job = st.macro_job = None
     st.save()
     await update.message.reply_text(
-        f"⏹ *Bot arrêté*\n"
-        f"Uptime: `{uptime()}` | Bankroll: `{st.bankroll:.2f}` | PnL: `{fmt(st.total_pnl)}` | WR: `{win_rate()}`",
+        f"⏹ *Arrêté* | Uptime: `{upt()}` | BR: `{st.bankroll:.2f}` | PnL: `{fmt(st.pnl)}` | WR: `{wr()}`",
         parse_mode="Markdown"
     )
 
-async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def cmd_status(update: Update, context):
     if not auth(update): return
-    session = get_session_context()
-    daily_loss = (st.daily_start_br-st.bankroll)/st.daily_start_br*100 if st.daily_start_br > 0 else 0
-    bet_info = f"{st.active_bet['dir']} {st.active_bet['amount']:.2f}$ @ ${st.active_bet['entry_price']:,.0f}" if st.active_bet else "Aucun"
-    cd_msg = f"\n⏸ Cooldown: `{int((st.cooldown_until-time.time())/60)}min`" if in_cooldown() else ""
+    sess = session_ctx()
+    dl = (st.daily_start-st.bankroll)/st.daily_start*100 if st.daily_start > 0 else 0
+    bet_info = f"{st.bet['dir']} {st.bet['amount']:.2f}$ @ ${st.bet['entry']:,.0f}" if st.bet else "Aucun"
+    cd_msg = f"\n⏸ Cooldown: `{int((st.cooldown_until-time.time())/60)}min`" if in_cd() else ""
 
     await update.message.reply_text(
-        f"📊 *STATUS v6* [{'📄' if st.paper_mode else '💰'}]\n"
+        f"📊 *STATUS v7* [{'📄' if st.paper_mode else '💰'}]\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"{'🟢 EN COURS' if st.running else '🔴 ARRÊTÉ'}{cd_msg}\n\n"
-        f"₿ `${st.current_price:,.2f}` | 24h: `{st.btc_24h.get('change_pct',0):+.2f}%`\n"
-        f"😱 F&G: `{st.fear_greed['value']}` ({st.fear_greed['label']})\n"
-        f"🕐 Session: `{session['session']}`\n\n"
-        f"💰 Bankroll: `{st.bankroll:.2f}` | ROI: `{roi()}`\n"
-        f"📅 Perte jour: `{daily_loss:.1f}%/{DAILY_LOSS_MAX*100:.0f}%`\n"
-        f"🎯 Bet actif: `{bet_info}`\n"
-        f"🚫 Refusés: `{st.skipped_trades}` | Uptime: `{uptime()}`",
-        parse_mode="Markdown", reply_markup=main_kb()
+        f"₿ `${st.price:,.2f}` | 24h: `{st.btc24.get('change_pct',0):+.2f}%`\n"
+        f"😱 F&G: `{st.fg['value']}` ({st.fg['label']})\n"
+        f"🕐 Session: `{sess['session']}` ({sess['quality']})\n\n"
+        f"💰 BR: `{st.bankroll:.2f}` | ROI: `{roi()}` | PnL: `{fmt(st.pnl)}`\n"
+        f"📅 Perte jour: `{dl:.1f}%/{DAILY_LOSS_MAX*100:.0f}%`\n"
+        f"🎯 Bet: `{bet_info}`\n"
+        f"🚫 Refusés: `{st.skipped}` | ⏱ `{upt()}`",
+        parse_mode="Markdown", reply_markup=kb()
     )
 
-async def cmd_ai(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def cmd_ai(update: Update, context):
     if not auth(update): return
-    d = st.last_ai_decision
+    d = st.last_decision
     if not d:
         await update.message.reply_text("⏳ Lance /run d'abord.")
         return
-    risk_e = {"LOW":"🟢","MEDIUM":"🟡","HIGH":"🔴"}.get(d.get("risk_level","MEDIUM"),"🟡")
+    risk_e = {"LOW":"🟢","MEDIUM":"🟡","HIGH":"🔴"}.get(d.get("risk","MEDIUM"),"🟡")
     dir_e  = "🟢" if d.get("dir")=="UP" else "🔴" if d.get("dir")=="DOWN" else "⚪"
-    sigs   = "\n".join(f"  • {s}" for s in d.get("key_signals",[]))
+    sigs   = "\n".join(f"  • {s}" for s in d.get("signals",[]))
     await update.message.reply_text(
         f"🧠 *DERNIÈRE DÉCISION AI*\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"{dir_e} *{d.get('dir') or 'PASS'}* | {risk_e} `{d.get('risk_level','?')}`\n"
-        f"Confiance: `{d.get('confidence',0)*100:.0f}%` | Mise: `{d.get('bet_size',0):.2f}$`\n"
-        f"Trade: `{'OUI ✅' if d.get('trade') else 'NON ❌'}`\n\n"
+        f"{dir_e} *{d.get('dir') or 'PASS'}* | {risk_e} | `{d.get('conf',0)*100:.0f}%`\n"
+        f"Trade: `{'OUI ✅' if d.get('trade') else 'NON ❌'}` | Mise: `{d.get('size',0):.2f}$`\n\n"
         f"💭 _{d.get('reasoning','—')}_\n\n"
-        f"🔑 Signaux:\n{sigs or '  —'}\n\n"
-        f"⚠️ _{d.get('main_concern','')}_",
+        f"🔑 Signaux:\n{sigs or '  —'}",
         parse_mode="Markdown"
     )
 
-async def cmd_fear(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def cmd_signal(update: Update, context):
     if not auth(update): return
-    fg = st.fear_greed
-    val = fg['value']
-    bar = "█" * (val//10) + "░" * (10 - val//10)
-    emoji = "😱" if val<20 else "😟" if val<40 else "😐" if val<60 else "😊" if val<80 else "🤑"
-    interp = ("Extrême Peur — souvent bon moment pour acheter" if val<20 else
-              "Peur — marché incertain" if val<40 else
-              "Neutre — pas de biais fort" if val<60 else
-              "Greed — attention aux retournements" if val<80 else
-              "Extrême Greed — risque élevé de correction")
-    btc = st.btc_24h
-    await update.message.reply_text(
-        f"😱 *FEAR & GREED INDEX*\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"{emoji} *{fg['label']}* — `{val}/100`\n"
-        f"`{bar}`\n\n"
-        f"_{interp}_\n\n"
-        f"₿ *BTC 24h:*\n"
-        f"Variation: `{btc.get('change_pct',0):+.2f}%`\n"
-        f"High: `${btc.get('high_24h',0):,.0f}` | Low: `${btc.get('low_24h',0):,.0f}`",
-        parse_mode="Markdown"
-    )
-
-async def cmd_session(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not auth(update): return
-    s = get_session_context()
-    sessions_info = (
-        "🌏 Asia (0-8h UTC): Volatilité modérée\n"
-        "🌍 Europe Open (8-12h): Bonne liquidité\n"
-        "😴 Lunch (12-14h): Éviter\n"
-        "🇺🇸 US Open (14-17h): MEILLEUR moment\n"
-        "🌆 US Afternoon (17-20h): Bonnes tendances\n"
-        "🌙 Overnight (22-0h): Éviter"
-    )
-    await update.message.reply_text(
-        f"🕐 *SESSION ACTUELLE*\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"Session: *{s['session']}*\n"
-        f"Heure Paris: `{s['hour_paris']}h`\n"
-        f"Qualité: _{s['quality']}_\n\n"
-        f"*Calendrier des sessions:*\n{sessions_info}",
-        parse_mode="Markdown"
-    )
-
-async def cmd_signal(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not auth(update): return
-    await update.message.reply_text("⏳ Analyse complète en cours...")
+    await update.message.reply_text("⏳ Analyse complète...")
     c1=await fetch_klines("1m",60); c5=await fetch_klines("5m",50)
     c15=await fetch_klines("15m",40); c1h=await fetch_klines("1h",30)
     if c5:
-        st.candles_1m=deque(c1,maxlen=100); st.candles_5m=deque(c5,maxlen=100)
-        st.candles_15m=deque(c15,maxlen=100); st.candles_1h=deque(c1h,maxlen=100)
-        st.current_price=c5[-1]["close"]
-    fg = await fetch_fear_greed(); st.fear_greed = fg
-    btc24 = await fetch_btc_24h(); st.btc_24h = btc24
-    session = get_session_context()
-    ind_1m=compute_indicators(list(st.candles_1m))
-    ind_5m=compute_indicators(list(st.candles_5m))
-    ind_15m=compute_indicators(list(st.candles_15m))
-    ind_1h=compute_indicators(list(st.candles_1h))
-    d = await claude_decide(ind_1m,ind_5m,ind_15m,ind_1h,st.trades[-15:],
-                            st.poly_sentiment,st.bankroll,st.consec_losses,fg,btc24,session)
-    st.last_ai_decision = d
+        st.c1=deque(c1,maxlen=100); st.c5=deque(c5,maxlen=100)
+        st.c15=deque(c15,maxlen=100); st.c1h=deque(c1h,maxlen=100)
+        st.price=c5[-1]["close"]
+    st.fg=await fetch_fear_greed(); st.btc24=await fetch_btc_24h()
+    i1=compute_ind(list(st.c1)); i5=compute_ind(list(st.c5))
+    i15=compute_ind(list(st.c15)); i1h=compute_ind(list(st.c1h))
+    sess=session_ctx()
+    d=await claude_decide(i1,i5,i15,i1h,st.trades[-15:],st.bankroll,
+                          st.consec,st.fg,st.btc24,sess)
+    st.last_decision=d
     dir_e="🟢" if d["dir"]=="UP" else "🔴" if d["dir"]=="DOWN" else "⚪"
-    risk_e={"LOW":"🟢","MEDIUM":"🟡","HIGH":"🔴"}.get(d.get("risk_level","MEDIUM"),"🟡")
-    sigs="\n".join(f"  • {s}" for s in d.get("key_signals",[])[:5])
+    risk_e={"LOW":"🟢","MEDIUM":"🟡","HIGH":"🔴"}.get(d.get("risk","MEDIUM"),"🟡")
+    sigs="\n".join(f"  • {s}" for s in d.get("signals",[])[:5])
     await update.message.reply_text(
-        f"🧠 *ANALYSE CLAUDE AI v6*\n"
+        f"🧠 *ANALYSE AI v7*\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"{dir_e} *{d['dir'] or 'PASS'}* | {risk_e} | `{d['confidence']*100:.0f}%`\n"
-        f"₿ `${ind_5m.get('price',0):,.2f}` | F&G: `{fg['value']}` | Session: `{session['session']}`\n\n"
+        f"{dir_e} *{d['dir'] or 'PASS'}* | {risk_e} | `{d['conf']*100:.0f}%`\n"
+        f"₿ `${i5.get('price',0):,.2f}` | F&G:`{st.fg['value']}` | `{sess['session']}`\n"
+        f"1h: `{'↑' if i1h.get('ema_bull') else '↓'}` EMA | MACD:`{i1h.get('macd_hist',0):+.2f}`\n\n"
         f"💭 _{d['reasoning']}_\n\n"
         f"🔑 Signaux:\n{sigs or '  Aucun'}",
         parse_mode="Markdown"
     )
 
-async def cmd_trades(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def cmd_trades(update: Update, context):
     if not auth(update): return
     trades = st.trades[-8:][::-1]
     if not trades:
         await update.message.reply_text("📈 Aucun trade.")
         return
-    lines = ["📈 *TRADES*\n━━━━━━━━━━━━━━━━━━━━━━━━"]
+    lines = ["📈 *TRADES v7*\n━━━━━━━━━━━━━━━━━━━━━━━━"]
     for t in trades:
         e="✅" if t["result"]=="WIN" else "❌"
         ts=datetime.fromtimestamp(t["ts"]).strftime("%d/%m %H:%M")
-        r=t.get("ai_reasoning","")[:45]
+        r=t.get("reasoning","")[:40]
         lines.append(f"{e} `{t['dir']}` `{fmt(t['pnl'])}$` `{ts}`\n   _{r}_")
+    if st.bet:
+        lines.append(f"\n🔄 *Actif:* `{st.bet['dir']}` `{st.bet['amount']:.2f}$` @ `${st.bet['entry']:,.0f}`")
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
-async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def cmd_stats(update: Update, context):
     if not auth(update): return
     total=st.wins+st.losses
-    avg_win=sum(t["pnl"] for t in st.trades if t["pnl"]>0)/max(st.wins,1)
-    avg_loss=abs(sum(t["pnl"] for t in st.trades if t["pnl"]<0))/max(st.losses,1)
-    rr=avg_win/avg_loss if avg_loss>0 else 0
-    peak,max_dd,rbr=BANKROLL_START,0.0,BANKROLL_START
+    aw=sum(t["pnl"] for t in st.trades if t["pnl"]>0)/max(st.wins,1)
+    al=abs(sum(t["pnl"] for t in st.trades if t["pnl"]<0))/max(st.losses,1)
+    rr=aw/al if al>0 else 0
+    peak=BANKROLL_START; mdd=0.0; rb=BANKROLL_START
     for t in st.trades:
-        rbr+=t["pnl"]
-        if rbr>peak: peak=rbr
-        dd=(peak-rbr)/peak*100 if peak>0 else 0
-        if dd>max_dd: max_dd=dd
-    patterns = analyze_patterns(st.trades) if len(st.trades)>=5 else "Pas assez de trades"
+        rb+=t["pnl"]
+        if rb>peak: peak=rb
+        dd=(peak-rb)/peak*100 if peak>0 else 0
+        if dd>mdd: mdd=dd
+    patterns=pattern_mem(st.trades)
     await update.message.reply_text(
-        f"📉 *STATS AI BOT v6*\n"
+        f"📉 *STATS v7*\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"Total: `{total}` (✅{st.wins} ❌{st.losses})\n"
-        f"Win Rate: `{win_rate()}` | ROI: `{roi()}`\n"
-        f"PnL: `{fmt(st.total_pnl)}$` | R:R: `{rr:.2f}`\n\n"
-        f"Gain moyen: `+{avg_win:.2f}$` | Perte: `-{avg_loss:.2f}$`\n"
-        f"Best streak: `+{st.best_streak}` | Max DD: `{max_dd:.1f}%`\n"
-        f"Refusés AI: `{st.skipped_trades}`\n"
+        f"Win Rate: `{wr()}` | ROI: `{roi()}`\n"
+        f"PnL: `{fmt(st.pnl)}$` | R:R: `{rr:.2f}`\n\n"
+        f"Gain moy: `+{aw:.2f}$` | Perte moy: `-{al:.2f}$`\n"
+        f"Best streak: `+{st.best_streak}` | Max DD: `{mdd:.1f}%`\n"
+        f"Refusés AI: `{st.skipped}`\n"
         f"Bankroll: `{st.bankroll:.2f} USDC`\n\n"
-        f"📊 *Patterns:*\n_{patterns}_",
+        f"📊 _{patterns}_",
         parse_mode="Markdown"
     )
 
-async def cmd_cooldown(update, context):
+async def cmd_fear(update: Update, context):
     if not auth(update): return
-    st.cooldown_until=0; st.consec_losses=0
-    await update.message.reply_text("✅ Cooldown reset.")
+    fg=st.fg; v=fg['value']
+    bar="█"*(v//10)+"░"*(10-v//10)
+    e="😱" if v<20 else "😟" if v<40 else "😐" if v<60 else "😊" if v<80 else "🤑"
+    interp=("Extrême Peur → biais UP en neutre" if v<20 else
+            "Peur → marché incertain" if v<40 else
+            "Neutre" if v<60 else
+            "Greed → attention" if v<80 else "Extrême Greed → biais DOWN")
+    btc=st.btc24
+    await update.message.reply_text(
+        f"😱 *FEAR & GREED*\n━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"{e} *{fg['label']}* — `{v}/100`\n`{bar}`\n\n_{interp}_\n\n"
+        f"₿ 24h: `{btc.get('change_pct',0):+.2f}%` | "
+        f"H:`${btc.get('high_24h',0):,.0f}` L:`${btc.get('low_24h',0):,.0f}`",
+        parse_mode="Markdown"
+    )
 
-async def cmd_paper(update, context):
+async def cmd_paper(update: Update, context):
     if not auth(update): return
     st.paper_mode = not st.paper_mode
-    await update.message.reply_text(f"Mode: *{'📄 PAPER' if st.paper_mode else '💰 RÉEL ⚠️'}*", parse_mode="Markdown")
+    await update.message.reply_text(
+        f"Mode: *{'📄 PAPER' if st.paper_mode else '💰 RÉEL ⚠️'}*",
+        parse_mode="Markdown"
+    )
     st.save()
 
-async def cmd_reset(update, context):
+async def cmd_reset(update: Update, context):
     if not auth(update): return
-    st.running=False
-    for j in [st.tick_job,st.price_job,st.macro_job]:
-        if j: j.schedule_removal()
-    st.bankroll=BANKROLL_START; st.trades=[]; st.active_bet=None
-    st.wins=st.losses=st.skipped_trades=st.consec_losses=0
-    st.total_pnl=st.streak=st.best_streak=st.worst_streak=0
+    st.running = False
+    for j in [st.tick_job, st.price_job, st.macro_job]:
+        if j:
+            try: j.schedule_removal()
+            except: pass
+    st.bankroll=BANKROLL_START; st.trades=[]; st.bet=None
+    st.wins=st.losses=st.skipped=st.consec=0
+    st.pnl=st.streak=st.best_streak=st.worst_streak=0
     st.cooldown_until=0; st.session_start=time.time()
-    st.candles_1m.clear(); st.candles_5m.clear(); st.candles_15m.clear(); st.candles_1h.clear()
+    st.c1.clear(); st.c5.clear(); st.c15.clear(); st.c1h.clear()
     if os.path.exists(DATA_FILE): os.remove(DATA_FILE)
-    await update.message.reply_text("🔄 Reset complet.", parse_mode="Markdown")
+    await update.message.reply_text("🔄 *Reset complet.*", parse_mode="Markdown")
 
-async def callback_handler(update, context):
+async def cmd_cooldown(update: Update, context):
+    if not auth(update): return
+    st.cooldown_until=0; st.consec=0
+    await update.message.reply_text("✅ Cooldown reset.", parse_mode="Markdown")
+
+async def cb(update: Update, context):
     q=update.callback_query; await q.answer()
-    h={"status":cmd_status,"ai_last":cmd_ai,"trades":cmd_trades,"stats":cmd_stats,
-       "fear":cmd_fear,"session":cmd_session,"run":cmd_run,"stop":cmd_stop,
-       "toggle_paper":cmd_paper,"indicators":cmd_signal}
+    h={"status":cmd_status,"ai":cmd_ai,"trades":cmd_trades,"stats":cmd_stats,
+       "fear":cmd_fear,"session":cmd_signal,"run":cmd_run,"stop":cmd_stop,"paper":cmd_paper}
     if q.data in h: await h[q.data](update, context)
 
+# ─── MAIN ──────────────────────────────────────────────────────────────────
 def main():
     st.load()
     app = Application.builder().token(TOKEN).build()
@@ -1217,12 +881,11 @@ def main():
         ("start",cmd_start),("run",cmd_run),("stop",cmd_stop),
         ("status",cmd_status),("ai",cmd_ai),("signal",cmd_signal),
         ("trades",cmd_trades),("stats",cmd_stats),("fear",cmd_fear),
-        ("session",cmd_session),("paper",cmd_paper),
-        ("cooldown",cmd_cooldown),("reset",cmd_reset),
+        ("paper",cmd_paper),("cooldown",cmd_cooldown),("reset",cmd_reset),
     ]:
         app.add_handler(CommandHandler(name, handler))
-    app.add_handler(CallbackQueryHandler(callback_handler))
-    log.info("🧠 PolyBot v6 Enhanced AI démarré")
+    app.add_handler(CallbackQueryHandler(cb))
+    log.info("🧠 PolyBot v7 FINAL démarré")
     app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
