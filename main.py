@@ -1,9 +1,8 @@
 """
-POLYMARKET BTC BOT v10.7
-FIX FINAL: Balance via API /data/balance de Polymarket (solde interne)
-Le wallet 0xa565 est un contrat Deposit Wallet — la balance
-n'est pas lisible via get_balance_allowance (toujours 0).
-La vraie balance est dans le système interne Polymarket.
+POLYMARKET BTC BOT v10.8
+FIX FINAL BALANCE: Polymarket Deposit Wallet n'a pas d'API balance publique.
+Solution: /setbalance pour sync manuelle + tracking automatique après trades.
+La bankroll est trackée en interne et mise à jour après chaque trade.
 """
 
 import asyncio, logging, os, json, time, math, aiohttp
@@ -12,7 +11,7 @@ from collections import deque
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 
-BOT_VERSION = "10.7"
+BOT_VERSION = "10.8"
 
 def load_env():
     env_path = os.path.join(os.path.dirname(__file__), '.env')
@@ -35,7 +34,6 @@ POLY_PROXY_WALLET  = os.getenv("POLY_PROXY_WALLET", "")
 POLY_FUNDER_WALLET = os.getenv("POLY_FUNDER_WALLET", "")
 POLY_HOST          = "https://clob.polymarket.com"
 POLY_GAMMA         = "https://gamma-api.polymarket.com"
-POLY_DATA          = "https://data-api.polymarket.com"
 POLY_CHAIN_ID      = 137
 MIN_BET_USD=2.0; MID_BET_USD=5.0; MAX_BET_USD=8.0; MAX_BET_PCT=0.06
 TAKE_PROFIT_MULT=2.0; TAKE_PROFIT_CHECK=30
@@ -51,7 +49,7 @@ log = logging.getLogger(__name__)
 
 class PolyClient:
     def __init__(self):
-        self.client=None; self.ready=False; self.allowance_set=False
+        self.client=None; self.ready=False
 
     def init_client(self):
         if not POLY_PRIVATE_KEY or not POLY_PROXY_WALLET:
@@ -62,105 +60,9 @@ class PolyClient:
                 signature_type=1, funder=POLY_PROXY_WALLET)
             creds = self.client.create_or_derive_api_creds()
             self.client.set_api_creds(creds)
-            self.ready=True
-            log.info("✅ Polymarket CLOB initialisé")
-            # Set allowances une fois
-            try:
-                from py_clob_client.clob_types import AssetType, BalanceAllowanceParams
-                self.client.update_balance_allowance(
-                    params=BalanceAllowanceParams(asset_type=AssetType.COLLATERAL))
-                self.allowance_set=True
-                log.info("✅ Allowances set")
-            except Exception as e:
-                log.warning(f"Allowances: {e}")
-            return True
+            self.ready=True; log.info("✅ Polymarket CLOB initialisé"); return True
         except ImportError: log.error("py-clob-client non installé"); return False
         except Exception as e: log.error(f"Polymarket init: {e}"); return False
-
-    async def get_balance(self):
-        """
-        ✅ v10.7 — 4 méthodes en cascade pour lire la balance Polymarket.
-        Le wallet proxy est un Deposit Wallet, balance interne Polymarket.
-        """
-        wallet = POLY_FUNDER_WALLET or POLY_PROXY_WALLET or ""
-        if not wallet:
-            return None
-
-        # Méthode 1: API data Polymarket /profile
-        try:
-            async with aiohttp.ClientSession() as s:
-                async with s.get(
-                    f"{POLY_DATA}/profile",
-                    params={"address": wallet},
-                    timeout=aiohttp.ClientTimeout(total=8)
-                ) as r:
-                    if r.status == 200:
-                        d = await r.json()
-                        if isinstance(d, dict):
-                            val = d.get("portfolio_value") or d.get("balance") or d.get("usdc")
-                            if val is not None:
-                                balance = round(float(val), 2)
-                                log.info(f"✅ M1 data/profile: {balance}")
-                                return balance
-        except Exception as e:
-            log.warning(f"M1: {e}")
-
-        # Méthode 2: Gamma API /profile
-        try:
-            async with aiohttp.ClientSession() as s:
-                async with s.get(
-                    f"{POLY_GAMMA}/profile",
-                    params={"address": wallet},
-                    timeout=aiohttp.ClientTimeout(total=8)
-                ) as r:
-                    if r.status == 200:
-                        d = await r.json()
-                        if isinstance(d, dict):
-                            val = d.get("balance") or d.get("usdc") or d.get("portfolio_value")
-                            if val is not None:
-                                balance = round(float(val), 2)
-                                log.info(f"✅ M2 gamma/profile: {balance}")
-                                return balance
-        except Exception as e:
-            log.warning(f"M2: {e}")
-
-        # Méthode 3: CLOB /profile
-        try:
-            async with aiohttp.ClientSession() as s:
-                async with s.get(
-                    f"{POLY_HOST}/profile",
-                    params={"address": wallet},
-                    timeout=aiohttp.ClientTimeout(total=8)
-                ) as r:
-                    if r.status == 200:
-                        d = await r.json()
-                        if isinstance(d, dict):
-                            for key in ["balance", "usdc", "portfolio_value", "collateral"]:
-                                val = d.get(key)
-                                if val is not None:
-                                    balance = round(float(val), 2)
-                                    log.info(f"✅ M3 clob/profile [{key}]: {balance}")
-                                    return balance
-        except Exception as e:
-            log.warning(f"M3: {e}")
-
-        # Méthode 4: CLOB /balance avec auth L1
-        if self.ready and self.client:
-            try:
-                from py_clob_client.clob_types import AssetType, BalanceAllowanceParams
-                result = self.client.get_balance_allowance(
-                    params=BalanceAllowanceParams(asset_type=AssetType.COLLATERAL))
-                if result:
-                    raw = result.get("balance", "0")
-                    balance = round(int(raw) / 1_000_000, 2)
-                    if balance > 0:
-                        log.info(f"✅ M4 get_balance_allowance: {balance}")
-                        return balance
-            except Exception as e:
-                log.warning(f"M4: {e}")
-
-        log.warning("Toutes les méthodes balance ont échoué ou retourné 0")
-        return None
 
     async def find_btc_5min_market(self):
         now=int(time.time()); current_ts=(now//300)*300
@@ -623,10 +525,9 @@ class State:
         self.skipped=0; self.pass_reasons=[]
         self.last_decision={}; self.last_conf_score={}; self.last_mom_score=0
         self.fg={"value":50,"label":"Neutral"}; self.btc24={}
-        self.tick_job=self.price_job=self.macro_job=self.tp_job=self.bal_job=None
+        self.tick_job=self.price_job=self.macro_job=self.tp_job=None
         self.current_market=None; self.active_order_id=None; self.active_token_id=None
         self.entry_token_price=0.0; self.shares_bought=0.0
-        self.last_real_balance=None
 
     def save(self):
         try:
@@ -635,7 +536,7 @@ class State:
                     "losses":self.losses,"pnl":self.pnl,"best_streak":self.best_streak,
                     "worst_streak":self.worst_streak,"consec":self.consec,"daily_start":self.daily_start,
                     "daily_ts":self.daily_ts,"paper_mode":self.paper_mode,"skipped":self.skipped,
-                    "pass_reasons":self.pass_reasons[-50:],"last_real_balance":self.last_real_balance},f,indent=2)
+                    "pass_reasons":self.pass_reasons[-50:]},f,indent=2)
         except Exception as e: log.error(f"Save: {e}")
 
     def load(self):
@@ -648,7 +549,6 @@ class State:
                 self.consec=d.get("consec",0); self.daily_start=d.get("daily_start",self.bankroll)
                 self.daily_ts=d.get("daily_ts",time.time()); self.paper_mode=d.get("paper_mode",PAPER_MODE)
                 self.skipped=d.get("skipped",0); self.pass_reasons=d.get("pass_reasons",[])
-                self.last_real_balance=d.get("last_real_balance",None)
                 log.info(f"State v{BOT_VERSION} chargé")
         except Exception as e: log.error(f"Load: {e}")
 
@@ -691,19 +591,6 @@ async def job_take_profit(context):
                 await send(context.bot,f"🎯 *TAKE PROFIT* x{gain_mult:.2f}\n`{bet['dir']}` | `+{gross:.2f} USDC`\nBR:`{st.bankroll:.2f}` | Streak:`{st.streak:+d}`")
                 st.save()
     except Exception as e: log.error(f"job_take_profit: {e}")
-
-async def job_sync_balance(context):
-    if st.paper_mode or not poly.ready or st.bet: return
-    try:
-        real_bal=await poly.get_balance()
-        if real_bal is not None and real_bal>1.0:
-            st.last_real_balance=real_bal
-            if abs(real_bal-st.bankroll)>0.05:
-                log.info(f"✅ Bankroll synced: {st.bankroll:.2f}→{real_bal:.2f} USDC")
-                st.bankroll=real_bal
-        else:
-            log.warning(f"Sync ignorée — balance={real_bal}")
-    except Exception as e: log.warning(f"Balance sync: {e}")
 
 async def job_price(context):
     p=await fetch_price()
@@ -819,7 +706,10 @@ async def cmd_start(update,context):
         f"🧠 *POLYMARKET BOT v{BOT_VERSION}*\n━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"Mode:*{'📄 PAPER' if st.paper_mode else '💰 RÉEL'}* | API:{'✅' if poly.ready else '❌'}\n"
         f"Wallet:`{w[:6]}...{w[-4:]}`\n\n"
-        f"*/run* */stop* */status* */signal* */score*\n*/market* */balance* */trades* */stats* */paper*",
+        f"📌 *Commandes:*\n"
+        f"*/run* */stop* */status* */signal* */score*\n"
+        f"*/market* */balance* */trades* */stats* */paper*\n"
+        f"*/setbalance 55.11* ← sync balance manuelle",
         parse_mode="Markdown",reply_markup=kb())
 
 async def cmd_run(update,context):
@@ -830,39 +720,59 @@ async def cmd_run(update,context):
         if not poly.init_client():
             await update.message.reply_text("⚠️ Polymarket indispo — paper mode activé",parse_mode="Markdown")
             st.paper_mode=True
-    st.running=True; st.session_start=time.time()
-    if not st.paper_mode and poly.ready:
-        await update.message.reply_text("⏳ Sync balance Polymarket...")
-        real_bal=await poly.get_balance()
-        if real_bal is not None and real_bal>1.0:
-            st.bankroll=real_bal; st.daily_start=real_bal; st.last_real_balance=real_bal
-            log.info(f"✅ Bankroll démarrage: {real_bal:.2f} USDC")
-        else:
-            fallback=st.last_real_balance or BANKROLL_START
-            st.bankroll=fallback; st.daily_start=fallback
-            log.warning(f"Balance indispo — fallback: {fallback:.2f}")
-    st.daily_ts=time.time()
+    st.running=True; st.session_start=time.time(); st.daily_ts=time.time()
     st.price_job=context.job_queue.run_repeating(job_price,interval=30,first=5)
     st.macro_job=context.job_queue.run_repeating(job_macro,interval=300,first=8)
     st.tick_job=context.job_queue.run_repeating(job_tick,interval=300,first=15)
     st.tp_job=context.job_queue.run_repeating(job_take_profit,interval=TAKE_PROFIT_CHECK,first=10)
-    st.bal_job=context.job_queue.run_repeating(job_sync_balance,interval=300,first=60)
     st.fg=await fetch_fear_greed(); st.btc24=await fetch_btc_24h(); sess=session_ctx()
     await update.message.reply_text(
         f"▶️ *Bot v{BOT_VERSION} démarré !*\nMode:*{'📄 PAPER' if st.paper_mode else '💰 RÉEL'}*\n"
         f"F&G:`{st.fg['value']}` | BTC:`{st.btc24.get('change_pct',0):+.2f}%`\n"
-        f"Session:`{sess['session']}` | Solde:`{st.bankroll:.2f} USDC`",parse_mode="Markdown")
+        f"Session:`{sess['session']}` | BR:`{st.bankroll:.2f} USDC`\n\n"
+        f"💡 Tape */setbalance 55.11* pour sync ton solde Polymarket",
+        parse_mode="Markdown")
     await job_tick(context)
 
 async def cmd_stop(update,context):
     if not auth(update): return
     st.running=False
-    for j in [st.tick_job,st.price_job,st.macro_job,st.tp_job,st.bal_job]:
+    for j in [st.tick_job,st.price_job,st.macro_job,st.tp_job]:
         if j:
             try: j.schedule_removal()
             except: pass
     st.tick_job=st.price_job=st.macro_job=st.tp_job=None; st.save()
     await update.message.reply_text(f"⏹ *Arrêté* | `{upt()}` | BR:`{st.bankroll:.2f}` | PnL:`{fmt(st.pnl)}` | WR:`{wr()}`",parse_mode="Markdown")
+
+async def cmd_setbalance(update,context):
+    """
+    ✅ v10.8 — Sync manuelle de la bankroll.
+    Usage: /setbalance 55.11
+    Polymarket Deposit Wallet n'a pas d'API balance publique,
+    donc on sync manuellement depuis l'interface Polymarket.
+    """
+    if not auth(update): return
+    args=context.args
+    if not args:
+        await update.message.reply_text(
+            "💡 *Usage:* `/setbalance 55.11`\n\n"
+            "Va sur polymarket.com → ton profil → copie ton solde USDC et tape la commande.",
+            parse_mode="Markdown"); return
+    try:
+        new_bal=round(float(args[0].replace(",",".")),2)
+        if new_bal<0 or new_bal>100000:
+            await update.message.reply_text("❌ Montant invalide."); return
+        old=st.bankroll; st.bankroll=new_bal
+        st.daily_start=new_bal; st.daily_ts=time.time()
+        st.save()
+        await update.message.reply_text(
+            f"✅ *Balance mise à jour*\n"
+            f"`{old:.2f}$` → `{new_bal:.2f}$`\n"
+            f"Daily start reset à `{new_bal:.2f}$`",
+            parse_mode="Markdown")
+        log.info(f"setbalance: {old:.2f}→{new_bal:.2f}")
+    except ValueError:
+        await update.message.reply_text("❌ Format invalide. Exemple: `/setbalance 55.11`",parse_mode="Markdown")
 
 async def cmd_status(update,context):
     if not auth(update): return
@@ -873,38 +783,31 @@ async def cmd_status(update,context):
         elapsed=int((time.time()-st.bet["ts"])/60)
         bet_info=f"{st.bet['dir']} {st.bet['amount']:.2f}$ ({elapsed}min)"
         if st.entry_token_price>0: bet_info+=f" token@{st.entry_token_price:.3f}"
-    real_txt=f" (réel:{st.last_real_balance:.2f}$)" if st.last_real_balance else ""
     await update.message.reply_text(
         f"📊 *STATUS v{BOT_VERSION}* [{'📄' if st.paper_mode else '💰'}]\n━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"{'🟢 EN COURS' if st.running else '🔴 ARRÊTÉ'} | {'✅ CLOB' if poly.ready else '❌ CLOB'}\n\n"
         f"₿`${st.price:,.2f}` | F&G:`{st.fg['value']}` | `{sess['session']}`\n"
         f"🎯 {score_info}\n\n"
-        f"💰 BR:`{st.bankroll:.2f}`{real_txt} | ROI:`{roi()}` | PnL:`{fmt(st.pnl)}`\n"
+        f"💰 BR:`{st.bankroll:.2f}$` | ROI:`{roi()}` | PnL:`{fmt(st.pnl)}`\n"
         f"📅 Perte jour:`{dl:.1f}%/{DAILY_LOSS_MAX*100:.0f}%`\n"
         f"🎲 Bet:`{bet_info}` | 🚫 Refusés:`{st.skipped}` | ⏱`{upt()}`",
         parse_mode="Markdown",reply_markup=kb())
 
 async def cmd_balance(update,context):
+    """v10.8 — Affiche la bankroll interne + rappel /setbalance"""
     if not auth(update): return
-    if st.paper_mode:
-        await update.message.reply_text(f"📄 *Paper Mode*\nBR simulée:`{st.bankroll:.2f}$`",parse_mode="Markdown"); return
-    if not poly.ready:
-        await update.message.reply_text("❌ Polymarket non connecté.\nLance /run d'abord."); return
-    await update.message.reply_text("⏳ Lecture balance Polymarket...")
-    bal=await poly.get_balance()
-    w=POLY_FUNDER_WALLET or POLY_PROXY_WALLET or "?"; short=f"{w[:6]}...{w[-4:]}"
-    if bal is not None and bal>0:
-        st.last_real_balance=bal
-        synced=""
-        if not st.bet and abs(bal-st.bankroll)>0.05:
-            st.bankroll=bal; st.save(); synced=" ✅ synced"
-        await update.message.reply_text(
-            f"💰 *Balance Polymarket*\n━━━━━━━━━━━━━━\n🔑`{short}`\n"
-            f"💵 USDC:`{bal:.2f}$`\n📊 BR bot:`{st.bankroll:.2f}$`{synced}",parse_mode="Markdown")
-    else:
-        await update.message.reply_text(
-            f"❌ *Balance indisponible*\n🔑`{short}`\n"
-            f"Dernière valeur connue:`{st.last_real_balance or '?'}$`",parse_mode="Markdown")
+    w=POLY_FUNDER_WALLET or POLY_PROXY_WALLET or "?"
+    short=f"{w[:6]}...{w[-4:]}"
+    mode_txt="📄 Paper" if st.paper_mode else "💰 Réel"
+    pnl_txt=f"`{fmt(st.pnl)}$`" if st.pnl!=0 else "`+0.00$`"
+    await update.message.reply_text(
+        f"💰 *Balance Bot*\n━━━━━━━━━━━━━━\n"
+        f"🔑 `{short}`\n"
+        f"📊 BR bot: `{st.bankroll:.2f} $`\n"
+        f"📈 PnL session: {pnl_txt}\n"
+        f"Mode: {mode_txt}\n\n"
+        f"💡 Pour sync avec Polymarket:\n`/setbalance <ton_solde>`",
+        parse_mode="Markdown")
 
 async def cmd_market(update,context):
     if not auth(update): return
@@ -1046,7 +949,7 @@ async def cmd_paper(update,context):
 async def cmd_reset(update,context):
     if not auth(update): return
     st.running=False
-    for j in [st.tick_job,st.price_job,st.macro_job,st.tp_job,st.bal_job]:
+    for j in [st.tick_job,st.price_job,st.macro_job,st.tp_job]:
         if j:
             try: j.schedule_removal()
             except: pass
@@ -1054,7 +957,7 @@ async def cmd_reset(update,context):
     st.wins=st.losses=st.skipped=st.consec=0; st.pnl=st.streak=st.best_streak=st.worst_streak=0
     st.cooldown_until=0; st.session_start=time.time(); st.pass_reasons=[]
     st.last_conf_score={}; st.last_mom_score=0; st.active_order_id=None
-    st.active_token_id=None; st.shares_bought=0; st.entry_token_price=0; st.last_real_balance=None
+    st.active_token_id=None; st.shares_bought=0; st.entry_token_price=0
     st.c1.clear(); st.c5.clear(); st.c15.clear(); st.c1h.clear(); st.c4h.clear()
     if os.path.exists(DATA_FILE): os.remove(DATA_FILE)
     await update.message.reply_text("🔄 *Reset complet.*",parse_mode="Markdown")
@@ -1063,37 +966,6 @@ async def cmd_cooldown(update,context):
     if not auth(update): return
     st.cooldown_until=0; st.consec=0
     await update.message.reply_text("✅ Cooldown reset.",parse_mode="Markdown")
-
-async def cmd_debug(update,context):
-    if not auth(update): return
-    wallet = POLY_FUNDER_WALLET or POLY_PROXY_WALLET or "?"
-    results=[f"🤖 VERSION:{BOT_VERSION}", f"WALLET:{wallet[:10]}..."]
-
-    # Test les 4 endpoints directement
-    for name, url, params in [
-        ("data/profile", f"{POLY_DATA}/profile", {"address": wallet}),
-        ("gamma/profile", f"{POLY_GAMMA}/profile", {"address": wallet}),
-        ("clob/profile",  f"{POLY_HOST}/profile",  {"address": wallet}),
-        ("clob/user",     f"{POLY_HOST}/user",      {"address": wallet}),
-    ]:
-        try:
-            async with aiohttp.ClientSession() as s:
-                async with s.get(url, params=params, timeout=aiohttp.ClientTimeout(total=6)) as r:
-                    txt = await r.text()
-                    results.append(f"{name} [{r.status}]: {txt[:120]}")
-        except Exception as e:
-            results.append(f"{name} ERR: {str(e)[:60]}")
-
-    bal = await poly.get_balance()
-    results.append(f"get_balance():{bal}")
-
-    # Envoyer en 2 parties si nécessaire
-    msg = "🔍 *DEBUG v10.7*\n" + "\n".join(f"`{r}`" for r in results)
-    if len(msg) > 4000:
-        await update.message.reply_text("🔍 *DEBUG v10.7 (1/2)*\n" + "\n".join(f"`{r}`" for r in results[:4]), parse_mode="Markdown")
-        await update.message.reply_text("🔍 *(2/2)*\n" + "\n".join(f"`{r}`" for r in results[4:]), parse_mode="Markdown")
-    else:
-        await update.message.reply_text(msg, parse_mode="Markdown")
 
 async def cb(update,context):
     q=update.callback_query; await q.answer()
@@ -1108,7 +980,8 @@ def main():
     for name,handler in [("start",cmd_start),("run",cmd_run),("stop",cmd_stop),("status",cmd_status),
         ("ai",cmd_ai),("signal",cmd_signal),("score",cmd_score),("trades",cmd_trades),("stats",cmd_stats),
         ("fear",cmd_fear),("passes",cmd_passes),("market",cmd_market),("balance",cmd_balance),
-        ("paper",cmd_paper),("cooldown",cmd_cooldown),("reset",cmd_reset),("debug",cmd_debug)]:
+        ("paper",cmd_paper),("cooldown",cmd_cooldown),("reset",cmd_reset),
+        ("setbalance",cmd_setbalance)]:
         app.add_handler(CommandHandler(name,handler))
     app.add_handler(CallbackQueryHandler(cb))
     log.info(f"🧠 PolyBot v{BOT_VERSION} démarré")
