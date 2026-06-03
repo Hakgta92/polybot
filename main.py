@@ -1437,6 +1437,54 @@ async def cmd_cooldown(update: Update, context):
     st.cooldown_until=0; st.consec=0
     await update.message.reply_text("✅ Cooldown reset.",parse_mode="Markdown")
 
+
+async def cmd_debug(update: Update, context):
+    """Debug: affiche la réponse brute de l'API Gamma"""
+    if not auth(update): return
+    await update.message.reply_text("⏳ Debug API Gamma...")
+    results = []
+    try:
+        async with aiohttp.ClientSession() as s:
+            # Test 1: events avec slug
+            async with s.get("https://gamma-api.polymarket.com/events",
+                             params={"slug": "btc-updown-5m", "limit": 3},
+                             timeout=aiohttp.ClientTimeout(total=10)) as r:
+                data = await r.json()
+                results.append(f"T1 status:{r.status} type:{type(data).__name__} len:{len(data) if isinstance(data,list) else 'dict'}")
+                if isinstance(data, list) and data:
+                    results.append(f"T1 slug:{data[0].get('slug','?')} title:{data[0].get('title','?')[:30]}")
+
+            # Test 2: events sans filtre
+            async with s.get("https://gamma-api.polymarket.com/events",
+                             params={"active": "true", "limit": 5},
+                             timeout=aiohttp.ClientTimeout(total=10)) as r:
+                data = await r.json()
+                results.append(f"T2 status:{r.status} len:{len(data) if isinstance(data,list) else '?'}")
+                if isinstance(data, list):
+                    for ev in data[:3]:
+                        sl = ev.get("slug","?")
+                        if "btc" in sl.lower():
+                            results.append(f"BTC found: {sl}")
+
+            # Test 3: markets avec recherche
+            async with s.get("https://gamma-api.polymarket.com/markets",
+                             params={"active": "true", "limit": 5},
+                             timeout=aiohttp.ClientTimeout(total=10)) as r:
+                data = await r.json()
+                results.append(f"T3 status:{r.status} type:{type(data).__name__}")
+                items = data if isinstance(data,list) else data.get("markets",[])
+                for m in items[:3]:
+                    sl = m.get("slug","?")
+                    if "btc" in sl.lower() or "updown" in sl.lower():
+                        results.append(f"BTC market: {sl[:40]}")
+
+    except Exception as e:
+        results.append(f"Error: {e}")
+
+    await update.message.reply_text(
+        "🔍 *DEBUG API*\n" + "\n".join(results),
+        parse_mode="Markdown")
+
 async def cb(update: Update, context):
     q=update.callback_query; await q.answer()
     h={"status":cmd_status,"ai":cmd_ai,"trades":cmd_trades,"stats":cmd_stats,
