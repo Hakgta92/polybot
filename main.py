@@ -151,13 +151,14 @@ def compute_ind(candles):
     }
 
 def session_ctx():
-    h = datetime.utcnow().hour
+    # Utiliser heure Paris (UTC+2)
+    h = (datetime.utcnow().hour + 2) % 24
     if   14 <= h < 17: return {"session":"US_OPEN",      "quality":"EXCELLENT", "score_bonus":2}
     elif 17 <= h < 20: return {"session":"US_AFTERNOON", "quality":"EXCELLENT", "score_bonus":1}
-    elif  8 <= h < 12: return {"session":"EU_OPEN",      "quality":"GOOD",      "score_bonus":1}
+    elif  9 <= h < 13: return {"session":"EU_OPEN",      "quality":"GOOD",      "score_bonus":1}
     elif 20 <= h < 22: return {"session":"US_CLOSE",     "quality":"GOOD",      "score_bonus":0}
-    elif  6 <= h <  8: return {"session":"ASIA_LATE",    "quality":"MEDIUM",    "score_bonus":0}
-    elif  0 <= h <  6: return {"session":"ASIA_EARLY",   "quality":"MEDIUM",    "score_bonus":-1}
+    elif  7 <= h <  9: return {"session":"ASIA_LATE",    "quality":"MEDIUM",    "score_bonus":0}
+    elif  1 <= h <  7: return {"session":"ASIA_EARLY",   "quality":"MEDIUM",    "score_bonus":-1}
     else:              return {"session":"OVERNIGHT",    "quality":"LOW",       "score_bonus":-1}
 
 def pattern_mem(trades):
