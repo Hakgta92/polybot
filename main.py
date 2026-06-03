@@ -1,8 +1,11 @@
 """
-POLYMARKET BTC BOT v10.8
-FIX FINAL BALANCE: Polymarket Deposit Wallet n'a pas d'API balance publique.
-Solution: /setbalance pour sync manuelle + tracking automatique après trades.
-La bankroll est trackée en interne et mise à jour après chaque trade.
+POLYMARKET BTC BOT v10.9
+NOUVEAUTÉS:
+  • Backup automatique état JSON toutes les 10min + au stop
+  • Kelly Criterion pour les mises (remplace MIN/MID/MAX fixe)
+  • Stop loss journalier intelligent: pause 2h puis reprise auto
+  • Seuils score adaptatifs selon session (plus souples la nuit)
+  • /backup pour forcer un backup manuel
 """
 
 import asyncio, logging, os, json, time, math, aiohttp
@@ -11,7 +14,7 @@ from collections import deque
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 
-BOT_VERSION = "10.8"
+BOT_VERSION = "10.9"
 
 def load_env():
     env_path = os.path.join(os.path.dirname(__file__), '.env')
@@ -35,18 +38,79 @@ POLY_FUNDER_WALLET = os.getenv("POLY_FUNDER_WALLET", "")
 POLY_HOST          = "https://clob.polymarket.com"
 POLY_GAMMA         = "https://gamma-api.polymarket.com"
 POLY_CHAIN_ID      = 137
-MIN_BET_USD=2.0; MID_BET_USD=5.0; MAX_BET_USD=8.0; MAX_BET_PCT=0.06
-TAKE_PROFIT_MULT=2.0; TAKE_PROFIT_CHECK=30
-POLY_FEE=0.02; DAILY_LOSS_MAX=0.12; MAX_CONSEC_LOSS=2; COOLDOWN_MIN=25
-MIN_SCORE_EXCEL=8; MIN_SCORE_GOOD=9; MIN_SCORE_LOW=10; MAX_TRADES_PER_H=3
-CLAUDE_API="https://api.anthropic.com/v1/messages"
-FEAR_GREED_API="https://api.alternative.me/fng/?limit=1"
-DATA_FILE="polybot_v10_state.json"
+
+# ── Mises ──
+MIN_BET_USD     = 1.5
+MAX_BET_USD     = 10.0
+MAX_BET_PCT     = 0.08   # Kelly ne dépassera pas 8% bankroll
+KELLY_FRACTION  = 0.25   # Kelly fractionnel (25% du Kelly plein = conservateur)
+
+# ── Filtres ──
+TAKE_PROFIT_MULT  = 2.0
+TAKE_PROFIT_CHECK = 30
+POLY_FEE          = 0.02
+MAX_CONSEC_LOSS   = 2
+COOLDOWN_MIN      = 25
+MAX_TRADES_PER_H  = 3
+
+# ── Stop loss intelligent ──
+DAILY_LOSS_MAX    = 0.15   # 15% perte → pause (avant c'était 12% = stop définitif)
+DAILY_PAUSE_H     = 2      # Pause 2h puis reprise automatique
+
+# ── Seuils score adaptatifs par session ──
+# Format: {session: (min_score, min_diff, min_momentum)}
+SESSION_THRESHOLDS = {
+    "US_OPEN":      (8,  2.5, 3),   # Excellent — seuils normaux
+    "US_AFTERNOON": (8,  2.5, 3),
+    "EU_OPEN":      (9,  3.0, 4),
+    "US_CLOSE":     (9,  3.0, 4),
+    "ASIA_LATE":    (10, 3.5, 4),   # Moyen — plus strict
+    "ASIA_EARLY":   (11, 4.0, 5),   # Mauvais — très strict
+    "OVERNIGHT":    (12, 4.5, 6),   # Nuit — quasi interdit
+}
+
+CLAUDE_API    = "https://api.anthropic.com/v1/messages"
+FEAR_GREED_API= "https://api.alternative.me/fng/?limit=1"
+DATA_FILE     = "polybot_v10_state.json"
+BACKUP_FILE   = "polybot_v10_backup.json"
 
 logging.basicConfig(format="%(asctime)s [%(levelname)s] %(message)s", level=logging.INFO,
     handlers=[logging.FileHandler("polybot_v10.log"), logging.StreamHandler()])
 log = logging.getLogger(__name__)
 
+# ─── KELLY CRITERION ───────────────────────────────────────────────────────
+def kelly_bet(bankroll: float, win_prob: float, payout_mult: float) -> float:
+    """
+    Kelly Criterion fractionnel pour calculer la mise optimale.
+    
+    win_prob    : probabilité de gagner (0.0-1.0), issue de la confiance Claude
+    payout_mult : multiplicateur de gain (ex: 2.0 = x2)
+    
+    Formule Kelly: f = (p * b - q) / b
+      p = prob win, q = 1-p, b = payout net (payout_mult - 1)
+    
+    On applique KELLY_FRACTION (25%) pour être conservateur.
+    """
+    if win_prob <= 0 or payout_mult <= 1:
+        return MIN_BET_USD
+    
+    b = payout_mult - 1          # gain net par unité misée
+    q = 1 - win_prob             # prob de perdre
+    
+    kelly_pct = (win_prob * b - q) / b
+    
+    if kelly_pct <= 0:
+        # Edge négatif — ne pas trader
+        return 0.0
+    
+    # Applique la fraction Kelly et le cap de bankroll
+    fractional_kelly = kelly_pct * KELLY_FRACTION
+    bet = bankroll * min(fractional_kelly, MAX_BET_PCT)
+    
+    # Clamp entre MIN et MAX
+    return round(max(MIN_BET_USD, min(bet, MAX_BET_USD)), 2)
+
+# ─── POLYMARKET CLIENT ─────────────────────────────────────────────────────
 class PolyClient:
     def __init__(self):
         self.client=None; self.ready=False
@@ -283,6 +347,10 @@ def session_ctx():
     elif  1<=h< 7: return {"session":"ASIA_EARLY",  "quality":"MEDIUM",   "score_bonus":-1}
     else:          return {"session":"OVERNIGHT",   "quality":"LOW",      "score_bonus":-2}
 
+def get_session_thresholds(session_name):
+    """Retourne (min_score, min_diff, min_momentum) selon la session"""
+    return SESSION_THRESHOLDS.get(session_name, (10, 3.5, 4))
+
 def compute_confluence_score(i1,i5,i15,i1h,i4h,fg,sess,adv):
     up=0.0; dn=0.0; signals=[]
     if i4h:
@@ -349,11 +417,12 @@ def compute_confluence_score(i1,i5,i15,i1h,i4h,fg,sess,adv):
         up*=0.8; dn*=0.8; signals.append("⚠️ Consolidation")
     direction="UP" if up>=dn else "DOWN"
     score=round(up if up>=dn else dn,1); diff=round(abs(up-dn),1)
-    sess_q=sess.get("quality","MEDIUM")
-    min_score=(MIN_SCORE_EXCEL if sess_q=="EXCELLENT" else MIN_SCORE_GOOD if sess_q=="GOOD" else MIN_SCORE_LOW)
+    # Seuils adaptatifs selon session
+    min_score, min_diff, min_mom = get_session_thresholds(sess.get("session","OVERNIGHT"))
     return {"score_up":round(up,1),"score_dn":round(dn,1),"score":score,"diff":diff,
             "direction":direction,"signals":signals[:8],"min_score":min_score,
-            "tradeable":score>=min_score and diff>=2.5}
+            "min_diff":min_diff,"min_mom":min_mom,
+            "tradeable":score>=min_score and diff>=min_diff}
 
 def compute_momentum_score(i1,i5,i15):
     score=0.0; r5=i5.get("rsi_14",50)
@@ -469,24 +538,27 @@ async def claude_decide(i1,i5,i15,i1h,i4h,adv,trades,bankroll,consec,fg,btc24,se
     same_up=recent_same_setup_loss(trades,"UP"); same_dn=recent_same_setup_loss(trades,"DOWN")
     trades_txt="".join(f"  {'✅' if t['result']=='WIN' else '❌'} {t['dir']} PnL:{t['pnl']:+.2f}$ score:{t.get('score',0)}\n" for t in trades[-6:]) or "  Aucun.\n"
     sigs_txt="\n".join(f"  ✓ {s}" for s in conf_score["signals"]) or "  Aucun"
-    if conf_score["score"]>=13 and sess.get("quality")=="EXCELLENT": suggested=MAX_BET_USD; bet_r="Score élevé→MAX"
-    elif conf_score["score"]>=11: suggested=MID_BET_USD; bet_r="Score bon→MID"
-    else: suggested=MIN_BET_USD; bet_r="Score limite→MIN"
-    if consec>=1: suggested=MIN_BET_USD; bet_r=f"{consec} perte(s)→MIN"
     ppu=round(1/tpu,2) if tpu>0 else 2.0; ppd=round(1/tpd,2) if tpd>0 else 2.0
+    # Kelly preview pour le prompt
+    kelly_up=kelly_bet(bankroll, 0.6, ppu) if ppu>1 else MIN_BET_USD
+    kelly_dn=kelly_bet(bankroll, 0.6, ppd) if ppd>1 else MIN_BET_USD
     i4h_txt=f"4h RSI:{i4h.get('rsi_14',50)} EMA:{'↑' if i4h.get('ema_bull') else '↓'}" if i4h else ""
     h_paris=(datetime.utcnow().hour+2)%24
+    min_score,min_diff,min_mom=get_session_thresholds(sess.get("session","OVERNIGHT"))
     prompt=f"""Expert trading binaire BTC UP/DOWN 5min Polymarket. Bets RÉELS.
 BTC:${i5.get('price',0):,.2f} | 24h:{btc24.get('change_pct',0):+.2f}% | F&G:{fg['value']}/100 | {sess['session']} {h_paris}h
-UP:{tpu:.3f}$→x{ppu} | DOWN:{tpd:.3f}$→x{ppd}
-Score:{conf_score['direction']} {conf_score['score']:.1f}/{conf_score['min_score']} UP:{conf_score['score_up']} DN:{conf_score['score_dn']} Diff:{conf_score['diff']} Tradeable:{'OUI' if conf_score['tradeable'] else 'NON'}
-Mom:{mom_score}/10 | Signaux:{sigs_txt}
+UP:{tpu:.3f}$→x{ppu} (Kelly≈{kelly_up:.2f}$) | DOWN:{tpd:.3f}$→x{ppd} (Kelly≈{kelly_dn:.2f}$)
+Score:{conf_score['direction']} {conf_score['score']:.1f}/{min_score} UP:{conf_score['score_up']} DN:{conf_score['score_dn']} Diff:{conf_score['diff']}/{min_diff} Tradeable:{'OUI' if conf_score['tradeable'] else 'NON'}
+Mom:{mom_score}/10 (seuil:{min_mom}) | Signaux:{sigs_txt}
 5m RSI:{i5.get('rsi_14',50)} MACD:{i5.get('macd_hist',0):+.4f} Stoch:{i5.get('stoch_k',50)} Vol:x{i5.get('vol_ratio',1):.1f}
 15m RSI:{i15.get('rsi_14',50)} EMA:{'↑' if i15.get('ema_bull') else '↓'} | 1h:{'↑' if i1h.get('ema_bull') else '↓'} | {i4h_txt}
 {patterns} | {loss_analysis}
 UP perdu récemment:{'OUI⚠️' if same_up else 'Non'} | DOWN:{'OUI⚠️' if same_dn else 'Non'}
-{trades_txt}Consec:{consec} | BR:{bankroll:.2f}$ | Suggéré:{suggested:.2f}$ ({bet_r})
-RÈGLES: trader si tradeable+mom≥4+payout≥1.8 | passer si mom<3 ou payout<1.5 | MIN si consec≥1
+{trades_txt}Consec:{consec} | BR:{bankroll:.2f}$
+RÈGLES v10.9 (Kelly): bet_size = Kelly fractionnel selon ta confiance et le payout
+✅ TRADER si: tradeable + mom≥{min_mom} + payout≥1.8 + edge positif
+❌ PASSER si: mom<{min_mom} ou payout<1.5 ou pas de tradeable
+Indique ta confiance précise (0.5-0.9) car elle calcule la mise Kelly.
 JSON UNIQUEMENT:{{"trade":true/false,"direction":"UP"/"DOWN"/null,"confidence":0.0-1.0,"bet_size":{MIN_BET_USD}-{MAX_BET_USD},"reasoning":"2 phrases FR","risk_level":"LOW"/"MEDIUM"/"HIGH"}}"""
     try:
         async with aiohttp.ClientSession() as s:
@@ -505,13 +577,21 @@ JSON UNIQUEMENT:{{"trade":true/false,"direction":"UP"/"DOWN"/null,"confidence":0
                     except: return d
                 direction=res.get("direction")
                 if direction not in ["UP","DOWN"]: direction=None
-                return {"dir":direction,"conf":sf(res.get("confidence"),0.0),"size":sf(res.get("bet_size"),0.0),
+                conf=sf(res.get("confidence"),0.0)
+                # Calcule la mise Kelly avec la confiance de Claude
+                if direction=="UP": payout=ppu
+                elif direction=="DOWN": payout=ppd
+                else: payout=2.0
+                kelly_size=kelly_bet(bankroll, conf, payout)
+                return {"dir":direction,"conf":conf,"size":kelly_size,
                         "reasoning":str(res.get("reasoning","")),"risk":res.get("risk_level","MEDIUM"),
-                        "trade":bool(res.get("trade",False)) and direction is not None}
+                        "trade":bool(res.get("trade",False)) and direction is not None,
+                        "kelly_pct":round(kelly_size/bankroll*100,1) if bankroll>0 else 0}
     except Exception as e:
         log.error(f"Claude: {e}")
         return {"dir":None,"conf":0,"size":0,"reasoning":f"Erreur:{str(e)[:60]}","trade":False}
 
+# ─── STATE ─────────────────────────────────────────────────────────────────
 class State:
     def __init__(self):
         self.running=False; self.paper_mode=PAPER_MODE; self.bankroll=BANKROLL_START
@@ -522,42 +602,91 @@ class State:
         self.streak=self.best_streak=self.worst_streak=0
         self.cooldown_until=0; self.session_start=time.time()
         self.daily_start=BANKROLL_START; self.daily_ts=time.time()
+        self.daily_pause_until=0   # ✅ Pause temporaire (pas stop définitif)
         self.skipped=0; self.pass_reasons=[]
         self.last_decision={}; self.last_conf_score={}; self.last_mom_score=0
         self.fg={"value":50,"label":"Neutral"}; self.btc24={}
-        self.tick_job=self.price_job=self.macro_job=self.tp_job=None
+        self.tick_job=self.price_job=self.macro_job=self.tp_job=self.backup_job=None
         self.current_market=None; self.active_order_id=None; self.active_token_id=None
         self.entry_token_price=0.0; self.shares_bought=0.0
 
     def save(self):
+        data = {
+            "bankroll":self.bankroll,"trades":self.trades[-200:],"wins":self.wins,
+            "losses":self.losses,"pnl":self.pnl,"best_streak":self.best_streak,
+            "worst_streak":self.worst_streak,"consec":self.consec,"daily_start":self.daily_start,
+            "daily_ts":self.daily_ts,"daily_pause_until":self.daily_pause_until,
+            "paper_mode":self.paper_mode,"skipped":self.skipped,
+            "pass_reasons":self.pass_reasons[-50:],"version":BOT_VERSION,
+            "saved_at":int(time.time())
+        }
         try:
             with open(DATA_FILE,"w") as f:
-                json.dump({"bankroll":self.bankroll,"trades":self.trades[-200:],"wins":self.wins,
-                    "losses":self.losses,"pnl":self.pnl,"best_streak":self.best_streak,
-                    "worst_streak":self.worst_streak,"consec":self.consec,"daily_start":self.daily_start,
-                    "daily_ts":self.daily_ts,"paper_mode":self.paper_mode,"skipped":self.skipped,
-                    "pass_reasons":self.pass_reasons[-50:]},f,indent=2)
+                json.dump(data,f,indent=2)
         except Exception as e: log.error(f"Save: {e}")
+        return data
+
+    def backup(self):
+        """Backup séparé pour survie aux reboots Railway"""
+        try:
+            data=self.save()
+            with open(BACKUP_FILE,"w") as f:
+                json.dump(data,f,indent=2)
+            log.info(f"✅ Backup effectué — BR:{self.bankroll:.2f} trades:{len(self.trades)}")
+            return True
+        except Exception as e:
+            log.error(f"Backup: {e}"); return False
 
     def load(self):
-        try:
-            if os.path.exists(DATA_FILE):
-                with open(DATA_FILE) as f: d=json.load(f)
-                self.bankroll=d.get("bankroll",BANKROLL_START); self.trades=d.get("trades",[])
-                self.wins=d.get("wins",0); self.losses=d.get("losses",0); self.pnl=d.get("pnl",0.0)
-                self.best_streak=d.get("best_streak",0); self.worst_streak=d.get("worst_streak",0)
-                self.consec=d.get("consec",0); self.daily_start=d.get("daily_start",self.bankroll)
-                self.daily_ts=d.get("daily_ts",time.time()); self.paper_mode=d.get("paper_mode",PAPER_MODE)
-                self.skipped=d.get("skipped",0); self.pass_reasons=d.get("pass_reasons",[])
-                log.info(f"State v{BOT_VERSION} chargé")
-        except Exception as e: log.error(f"Load: {e}")
+        # Essaie d'abord le fichier principal, puis le backup
+        for filepath in [DATA_FILE, BACKUP_FILE]:
+            try:
+                if os.path.exists(filepath):
+                    with open(filepath) as f: d=json.load(f)
+                    self.bankroll=d.get("bankroll",BANKROLL_START)
+                    self.trades=d.get("trades",[]); self.wins=d.get("wins",0)
+                    self.losses=d.get("losses",0); self.pnl=d.get("pnl",0.0)
+                    self.best_streak=d.get("best_streak",0); self.worst_streak=d.get("worst_streak",0)
+                    self.consec=d.get("consec",0); self.daily_start=d.get("daily_start",self.bankroll)
+                    self.daily_ts=d.get("daily_ts",time.time())
+                    self.daily_pause_until=d.get("daily_pause_until",0)
+                    self.paper_mode=d.get("paper_mode",PAPER_MODE)
+                    self.skipped=d.get("skipped",0); self.pass_reasons=d.get("pass_reasons",[])
+                    saved_at=d.get("saved_at",0)
+                    age=int((time.time()-saved_at)/60) if saved_at else 0
+                    log.info(f"✅ State chargé depuis {filepath} (sauvé il y a {age}min) — BR:{self.bankroll:.2f}")
+                    return
+            except Exception as e: log.error(f"Load {filepath}: {e}")
 
 st=State()
 
 def check_daily():
+    """
+    ✅ v10.9 — Stop loss intelligent.
+    Si perte > DAILY_LOSS_MAX → pause DAILY_PAUSE_H heures (pas stop définitif).
+    Après la pause, reprend automatiquement avec daily_start reset.
+    """
     now=time.time()
-    if now-st.daily_ts>86400: st.daily_start=st.bankroll; st.daily_ts=now
-    return st.daily_start>0 and (st.daily_start-st.bankroll)/st.daily_start>=DAILY_LOSS_MAX
+    # Reset journalier
+    if now-st.daily_ts>86400:
+        st.daily_start=st.bankroll; st.daily_ts=now
+        st.daily_pause_until=0
+        return False
+    # En pause ?
+    if st.daily_pause_until>0 and now<st.daily_pause_until:
+        return True  # Toujours en pause
+    # La pause est terminée → reset et continue
+    if st.daily_pause_until>0 and now>=st.daily_pause_until:
+        st.daily_pause_until=0
+        st.daily_start=st.bankroll  # Reset le daily_start
+        log.info("✅ Pause journalière terminée — reprise trading")
+        return False
+    # Vérifie si on doit mettre en pause
+    if st.daily_start>0 and (st.daily_start-st.bankroll)/st.daily_start>=DAILY_LOSS_MAX:
+        st.daily_pause_until=now+(DAILY_PAUSE_H*3600)
+        log.warning(f"⏸ Pause {DAILY_PAUSE_H}h — perte journalière atteinte")
+        return True
+    return False
 
 def in_cd(): return time.time()<st.cooldown_until
 
@@ -567,6 +696,12 @@ async def send(bot,text,parse_mode="Markdown"):
         log.error(f"Send: {e}")
         try: await bot.send_message(chat_id=ALLOWED_UID,text=text.replace("*","").replace("`","").replace("_","")); return True
         except: return False
+
+# ─── JOBS ──────────────────────────────────────────────────────────────────
+async def job_backup(context):
+    """✅ Backup automatique toutes les 10min"""
+    ok=st.backup()
+    if ok: log.info("Auto-backup OK")
 
 async def job_take_profit(context):
     if not st.bet or not st.active_token_id or st.paper_mode: return
@@ -589,7 +724,7 @@ async def job_take_profit(context):
                 st.bet=None; st.active_token_id=None; st.active_order_id=None
                 st.shares_bought=0; st.entry_token_price=0
                 await send(context.bot,f"🎯 *TAKE PROFIT* x{gain_mult:.2f}\n`{bet['dir']}` | `+{gross:.2f} USDC`\nBR:`{st.bankroll:.2f}` | Streak:`{st.streak:+d}`")
-                st.save()
+                st.backup()
     except Exception as e: log.error(f"job_take_profit: {e}")
 
 async def job_price(context):
@@ -601,15 +736,21 @@ async def job_macro(context):
 
 async def job_tick(context):
     if not st.running: return
-    if check_daily():
-        st.running=False; await send(context.bot,"🛑 *Limite journalière atteinte* — Bot arrêté."); return
+    paused=check_daily()
+    if paused:
+        remaining=int((st.daily_pause_until-time.time())/60)
+        if remaining%30==0 and remaining>0:  # Notif toutes les 30min
+            await send(context.bot,f"⏸ *Pause journalière* — reprise dans `{remaining}min`")
+        return
     if in_cd(): return
+
     c1=await fetch_klines("1m",60); c5=await fetch_klines("5m",50)
     c15=await fetch_klines("15m",40); c1h=await fetch_klines("1h",30); c4h=await fetch_klines("4h",20)
     if not c5: return
     st.c1=deque(c1,maxlen=100); st.c5=deque(c5,maxlen=100); st.c15=deque(c15,maxlen=100)
     st.c1h=deque(c1h,maxlen=100); st.c4h=deque(c4h,maxlen=50); st.price=c5[-1]["close"]
     if trades_last_hour(st.trades)>=MAX_TRADES_PER_H: return
+
     if st.bet:
         bet=st.bet; won=bet["dir"]==("UP" if st.price>bet["entry"] else "DOWN")
         gross=bet["amount"]*(1-POLY_FEE) if won else -bet["amount"]
@@ -631,7 +772,8 @@ async def job_tick(context):
             st.bet=None
             cd_msg=f"\n⏸ Cooldown {COOLDOWN_MIN}min" if in_cd() else ""
             await send(context.bot,f"{'✅' if won else '❌'} *Trade clôturé* [📄]\n`{bet['dir']}` `${bet['entry']:,.0f}`→`${st.price:,.0f}`\nPnL:`{'+' if gross>=0 else ''}{gross:.2f}$` BR:`{st.bankroll:.2f}` Streak:`{st.streak:+d}`{cd_msg}")
-            st.save()
+            st.backup()
+
     if in_cd(): return
     if not is_trending(list(st.c5),list(st.c15)): st.skipped+=1; return
     i1=compute_ind(list(st.c1)); i5=compute_ind(list(st.c5)); i15=compute_ind(list(st.c15))
@@ -642,12 +784,15 @@ async def job_tick(context):
     conf_score=compute_confluence_score(i1,i5,i15,i1h,i4h,st.fg,sess,adv)
     mom_score=compute_momentum_score(i1,i5,i15)
     st.last_conf_score=conf_score; st.last_mom_score=mom_score
+    _,_,min_mom=get_session_thresholds(sess.get("session","OVERNIGHT"))
+
     if not conf_score["tradeable"]:
         st.skipped+=1; st.pass_reasons.append({"ts":int(time.time()),"reason":f"Score {conf_score['score']:.1f}<{conf_score['min_score']}"}); return
-    if mom_score<3:
-        st.skipped+=1; st.pass_reasons.append({"ts":int(time.time()),"reason":f"Momentum faible ({mom_score}/10)"}); return
+    if mom_score<min_mom:
+        st.skipped+=1; st.pass_reasons.append({"ts":int(time.time()),"reason":f"Mom {mom_score}<{min_mom}"}); return
     if i5.get("atr_pct",0)<0.03: st.skipped+=1; return
     if i5.get("vol_ratio",1)<0.4: st.skipped+=1; return
+
     tpu=0.5; tpd=0.5
     if not st.paper_mode:
         market=await poly.find_btc_5min_market()
@@ -657,12 +802,17 @@ async def job_tick(context):
             tpd=await poly.get_token_price(market["token_down"])
         else:
             st.skipped+=1; st.pass_reasons.append({"ts":int(time.time()),"reason":"Aucun marché actif"}); return
+
     dec=await claude_decide(i1,i5,i15,i1h,i4h,adv,st.trades[-15:],st.bankroll,st.consec,st.fg,st.btc24,sess,conf_score,mom_score,tpu,tpd)
     st.last_decision=dec
+
     if dec["trade"] and dec["dir"] and not st.bet:
-        amount=max(MIN_BET_USD,min(dec["size"],MAX_BET_USD,st.bankroll*MAX_BET_PCT))
-        amount=round(amount,2)
-        if amount<MIN_BET_USD or st.bankroll<amount: return
+        # Mise Kelly déjà calculée par claude_decide
+        amount=dec["size"]
+        if amount<=0 or amount<MIN_BET_USD:
+            st.skipped+=1; st.pass_reasons.append({"ts":int(time.time()),"reason":f"Kelly edge négatif"}); return
+        if st.bankroll<amount: return
+
         order_id=None; token_used=None; entry_tp=0.5
         if not st.paper_mode and st.current_market:
             token_used=st.current_market["token_up"] if dec["dir"]=="UP" else st.current_market["token_down"]
@@ -672,16 +822,26 @@ async def job_tick(context):
                 await send(context.bot,"⚠️ *Ordre Polymarket refusé*"); return
             st.active_order_id=order_id; st.active_token_id=token_used
             st.entry_token_price=entry_tp; st.shares_bought=round(amount/entry_tp,4) if entry_tp>0 else 0
+
         st.bet={"dir":dec["dir"],"amount":amount,"conf":dec["conf"],"entry":st.price,
                 "reasoning":dec["reasoning"],"ts":int(time.time()),"score":conf_score["score"],"session":sess["session"]}
         mode="💰 RÉEL" if not st.paper_mode else "📄 paper"
         risk_e={"LOW":"🟢","MEDIUM":"🟡","HIGH":"🔴"}.get(dec["risk"],"🟡")
         sigs="\n".join(f"  • {s}" for s in conf_score["signals"][:4])
         pinfo=f"\nToken:`{entry_tp:.3f}$`→x`{round(1/entry_tp,2) if entry_tp>0 else '?'}` TP:x`{TAKE_PROFIT_MULT}`" if not st.paper_mode else ""
-        await send(context.bot,f"🧠 *Bet placé* [{mode}]\n━━━━━━━━━━━━━━━\n*{dec['dir']}* | `{amount:.2f}$` | `{dec['conf']*100:.0f}%` | {risk_e}\nScore:`{conf_score['score']:.1f}` Mom:`{mom_score}/10`{pinfo}\nBTC:`${st.price:,.2f}` | `{sess['session']}`\nF&G:`{st.fg['value']}` 4h:`{'↑' if i4h.get('ema_bull') else '↓' if i4h else '?'}` 15m:`{'↑' if i15.get('ema_bull') else '↓'}` 1h:`{'↑' if i1h.get('ema_bull') else '↓'}`\n💭 _{dec['reasoning']}_\n🔑 Signaux:\n{sigs}")
+        kelly_info=f" Kelly:`{dec.get('kelly_pct',0):.1f}%`"
+        await send(context.bot,
+            f"🧠 *Bet placé* [{mode}]\n━━━━━━━━━━━━━━━\n"
+            f"*{dec['dir']}* | `{amount:.2f}$`{kelly_info} | `{dec['conf']*100:.0f}%` | {risk_e}\n"
+            f"Score:`{conf_score['score']:.1f}` Mom:`{mom_score}/10`{pinfo}\n"
+            f"BTC:`${st.price:,.2f}` | `{sess['session']}`\n"
+            f"F&G:`{st.fg['value']}` 4h:`{'↑' if i4h.get('ema_bull') else '↓' if i4h else '?'}` "
+            f"15m:`{'↑' if i15.get('ema_bull') else '↓'}` 1h:`{'↑' if i1h.get('ema_bull') else '↓'}`\n\n"
+            f"💭 _{dec['reasoning']}_\n🔑 Signaux:\n{sigs}")
     else:
         st.skipped+=1; st.pass_reasons.append({"ts":int(time.time()),"reason":f"Claude PASS:{dec['reasoning'][:50]}"})
 
+# ─── HELPERS ───────────────────────────────────────────────────────────────
 def auth(u): return ALLOWED_UID==0 or u.effective_user.id==ALLOWED_UID
 def fmt(v): return f"+{v:.2f}" if v>=0 else f"{v:.2f}"
 def wr():
@@ -699,6 +859,7 @@ def kb():
         [InlineKeyboardButton("🟢 Actif" if st.running else "🔴 Arrêté",callback_data="status"),
          InlineKeyboardButton("💰 Réel" if not st.paper_mode else "📄 Paper",callback_data="paper")]])
 
+# ─── COMMANDES ─────────────────────────────────────────────────────────────
 async def cmd_start(update,context):
     if not auth(update): return
     w=POLY_FUNDER_WALLET or POLY_PROXY_WALLET or "?"
@@ -706,10 +867,14 @@ async def cmd_start(update,context):
         f"🧠 *POLYMARKET BOT v{BOT_VERSION}*\n━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"Mode:*{'📄 PAPER' if st.paper_mode else '💰 RÉEL'}* | API:{'✅' if poly.ready else '❌'}\n"
         f"Wallet:`{w[:6]}...{w[-4:]}`\n\n"
-        f"📌 *Commandes:*\n"
+        f"🆕 v10.9:\n"
+        f"  ✅ Kelly Criterion pour les mises\n"
+        f"  ✅ Backup auto toutes les 10min\n"
+        f"  ✅ Pause 2h si -15% (reprend seul)\n"
+        f"  ✅ Seuils adaptatifs par session\n\n"
         f"*/run* */stop* */status* */signal* */score*\n"
-        f"*/market* */balance* */trades* */stats* */paper*\n"
-        f"*/setbalance 55.11* ← sync balance manuelle",
+        f"*/market* */balance* */trades* */stats*\n"
+        f"*/setbalance 55.11* • */backup*",
         parse_mode="Markdown",reply_markup=kb())
 
 async def cmd_run(update,context):
@@ -725,38 +890,50 @@ async def cmd_run(update,context):
     st.macro_job=context.job_queue.run_repeating(job_macro,interval=300,first=8)
     st.tick_job=context.job_queue.run_repeating(job_tick,interval=300,first=15)
     st.tp_job=context.job_queue.run_repeating(job_take_profit,interval=TAKE_PROFIT_CHECK,first=10)
+    st.backup_job=context.job_queue.run_repeating(job_backup,interval=600,first=60)  # Backup toutes les 10min
     st.fg=await fetch_fear_greed(); st.btc24=await fetch_btc_24h(); sess=session_ctx()
+    min_score,min_diff,min_mom=get_session_thresholds(sess["session"])
     await update.message.reply_text(
         f"▶️ *Bot v{BOT_VERSION} démarré !*\nMode:*{'📄 PAPER' if st.paper_mode else '💰 RÉEL'}*\n"
         f"F&G:`{st.fg['value']}` | BTC:`{st.btc24.get('change_pct',0):+.2f}%`\n"
-        f"Session:`{sess['session']}` | BR:`{st.bankroll:.2f} USDC`\n\n"
-        f"💡 Tape */setbalance 55.11* pour sync ton solde Polymarket",
+        f"Session:`{sess['session']}` | Seuils: score≥`{min_score}` mom≥`{min_mom}`\n"
+        f"BR:`{st.bankroll:.2f} USDC` | Backup auto: ✅ 10min\n\n"
+        f"💡 Tape */setbalance 55.11* pour sync ton solde",
         parse_mode="Markdown")
     await job_tick(context)
 
 async def cmd_stop(update,context):
     if not auth(update): return
     st.running=False
-    for j in [st.tick_job,st.price_job,st.macro_job,st.tp_job]:
+    for j in [st.tick_job,st.price_job,st.macro_job,st.tp_job,st.backup_job]:
         if j:
             try: j.schedule_removal()
             except: pass
-    st.tick_job=st.price_job=st.macro_job=st.tp_job=None; st.save()
-    await update.message.reply_text(f"⏹ *Arrêté* | `{upt()}` | BR:`{st.bankroll:.2f}` | PnL:`{fmt(st.pnl)}` | WR:`{wr()}`",parse_mode="Markdown")
+    st.tick_job=st.price_job=st.macro_job=st.tp_job=st.backup_job=None
+    st.backup()  # Backup au stop
+    await update.message.reply_text(
+        f"⏹ *Arrêté* | `{upt()}` | BR:`{st.bankroll:.2f}` | PnL:`{fmt(st.pnl)}` | WR:`{wr()}`\n"
+        f"💾 Backup sauvegardé.",parse_mode="Markdown")
+
+async def cmd_backup(update,context):
+    """Force un backup manuel"""
+    if not auth(update): return
+    ok=st.backup()
+    trades_count=len(st.trades)
+    if ok:
+        await update.message.reply_text(
+            f"💾 *Backup effectué*\n"
+            f"BR:`{st.bankroll:.2f}$` | Trades:`{trades_count}` | PnL:`{fmt(st.pnl)}$`",
+            parse_mode="Markdown")
+    else:
+        await update.message.reply_text("❌ Backup échoué — vérifie les logs.")
 
 async def cmd_setbalance(update,context):
-    """
-    ✅ v10.8 — Sync manuelle de la bankroll.
-    Usage: /setbalance 55.11
-    Polymarket Deposit Wallet n'a pas d'API balance publique,
-    donc on sync manuellement depuis l'interface Polymarket.
-    """
     if not auth(update): return
     args=context.args
     if not args:
         await update.message.reply_text(
-            "💡 *Usage:* `/setbalance 55.11`\n\n"
-            "Va sur polymarket.com → ton profil → copie ton solde USDC et tape la commande.",
+            "💡 *Usage:* `/setbalance 55.11`\n\nVa sur polymarket.com → profil → copie ton solde.",
             parse_mode="Markdown"); return
     try:
         new_bal=round(float(args[0].replace(",",".")),2)
@@ -764,49 +941,56 @@ async def cmd_setbalance(update,context):
             await update.message.reply_text("❌ Montant invalide."); return
         old=st.bankroll; st.bankroll=new_bal
         st.daily_start=new_bal; st.daily_ts=time.time()
-        st.save()
+        st.daily_pause_until=0  # Reset la pause si elle était active
+        st.backup()
         await update.message.reply_text(
-            f"✅ *Balance mise à jour*\n"
-            f"`{old:.2f}$` → `{new_bal:.2f}$`\n"
-            f"Daily start reset à `{new_bal:.2f}$`",
+            f"✅ *Balance mise à jour*\n`{old:.2f}$` → `{new_bal:.2f}$`\nDaily start reset.",
             parse_mode="Markdown")
-        log.info(f"setbalance: {old:.2f}→{new_bal:.2f}")
     except ValueError:
         await update.message.reply_text("❌ Format invalide. Exemple: `/setbalance 55.11`",parse_mode="Markdown")
 
 async def cmd_status(update,context):
     if not auth(update): return
-    sess=session_ctx(); dl=(st.daily_start-st.bankroll)/st.daily_start*100 if st.daily_start>0 else 0
-    cs=st.last_conf_score; score_info=f"`{cs.get('score',0):.1f}/20` Mom:`{st.last_mom_score}/10`" if cs else "—"
+    sess=session_ctx()
+    dl=(st.daily_start-st.bankroll)/st.daily_start*100 if st.daily_start>0 else 0
+    cs=st.last_conf_score
+    score_info=f"`{cs.get('score',0):.1f}/{cs.get('min_score',10)}` Mom:`{st.last_mom_score}/{cs.get('min_mom',4)}`" if cs else "—"
     bet_info="Aucun"
     if st.bet:
         elapsed=int((time.time()-st.bet["ts"])/60)
         bet_info=f"{st.bet['dir']} {st.bet['amount']:.2f}$ ({elapsed}min)"
         if st.entry_token_price>0: bet_info+=f" token@{st.entry_token_price:.3f}"
+    pause_info=""
+    if st.daily_pause_until>time.time():
+        remaining=int((st.daily_pause_until-time.time())/60)
+        pause_info=f"\n⏸ Pause journalière: `{remaining}min` restant"
+    min_score,min_diff,min_mom=get_session_thresholds(sess["session"])
     await update.message.reply_text(
         f"📊 *STATUS v{BOT_VERSION}* [{'📄' if st.paper_mode else '💰'}]\n━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"{'🟢 EN COURS' if st.running else '🔴 ARRÊTÉ'} | {'✅ CLOB' if poly.ready else '❌ CLOB'}\n\n"
         f"₿`${st.price:,.2f}` | F&G:`{st.fg['value']}` | `{sess['session']}`\n"
+        f"Seuils: score≥`{min_score}` diff≥`{min_diff}` mom≥`{min_mom}`\n"
         f"🎯 {score_info}\n\n"
         f"💰 BR:`{st.bankroll:.2f}$` | ROI:`{roi()}` | PnL:`{fmt(st.pnl)}`\n"
-        f"📅 Perte jour:`{dl:.1f}%/{DAILY_LOSS_MAX*100:.0f}%`\n"
+        f"📅 Perte jour:`{dl:.1f}%/{DAILY_LOSS_MAX*100:.0f}%`{pause_info}\n"
         f"🎲 Bet:`{bet_info}` | 🚫 Refusés:`{st.skipped}` | ⏱`{upt()}`",
         parse_mode="Markdown",reply_markup=kb())
 
 async def cmd_balance(update,context):
-    """v10.8 — Affiche la bankroll interne + rappel /setbalance"""
     if not auth(update): return
     w=POLY_FUNDER_WALLET or POLY_PROXY_WALLET or "?"
     short=f"{w[:6]}...{w[-4:]}"
     mode_txt="📄 Paper" if st.paper_mode else "💰 Réel"
-    pnl_txt=f"`{fmt(st.pnl)}$`" if st.pnl!=0 else "`+0.00$`"
+    # Kelly info
+    kelly_ex=kelly_bet(st.bankroll, 0.65, 2.0)
     await update.message.reply_text(
         f"💰 *Balance Bot*\n━━━━━━━━━━━━━━\n"
         f"🔑 `{short}`\n"
-        f"📊 BR bot: `{st.bankroll:.2f} $`\n"
-        f"📈 PnL session: {pnl_txt}\n"
+        f"📊 BR: `{st.bankroll:.2f} $`\n"
+        f"📈 PnL: `{fmt(st.pnl)}$`\n"
+        f"🎲 Kelly ex (65%,x2): `{kelly_ex:.2f}$`\n"
         f"Mode: {mode_txt}\n\n"
-        f"💡 Pour sync avec Polymarket:\n`/setbalance <ton_solde>`",
+        f"💡 `/setbalance <montant>` pour sync",
         parse_mode="Markdown")
 
 async def cmd_market(update,context):
@@ -815,10 +999,14 @@ async def cmd_market(update,context):
     market=await poly.find_btc_5min_market()
     if not market: await update.message.reply_text("❌ Aucun marché BTC 5min trouvé."); return
     tu=await poly.get_token_price(market["token_up"]); td=await poly.get_token_price(market["token_down"])
+    pu=round(1/tu,2) if tu>0 else 0; pd=round(1/td,2) if td>0 else 0
+    # Kelly pour les deux directions
+    ku=kelly_bet(st.bankroll, 0.6, pu)
+    kd=kelly_bet(st.bankroll, 0.6, pd)
     await update.message.reply_text(
         f"🎯 *MARCHÉ ACTIF*\n━━━━━━━━━━━━━━━━━━━━━━━━\n_{market['question']}_\n\n"
-        f"🟢 UP:`{tu:.3f}$`→x`{round(1/tu,2) if tu>0 else '?'}`\n"
-        f"🔴 DOWN:`{td:.3f}$`→x`{round(1/td,2) if td>0 else '?'}`\n"
+        f"🟢 UP:`{tu:.3f}$`→x`{pu}` Kelly≈`{ku:.2f}$`\n"
+        f"🔴 DOWN:`{td:.3f}$`→x`{pd}` Kelly≈`{kd:.2f}$`\n"
         f"Fin:`{market.get('end_date','?')}`",parse_mode="Markdown")
 
 async def cmd_score(update,context):
@@ -836,6 +1024,7 @@ async def cmd_score(update,context):
     sess=session_ctx(); adv=compute_advanced_signals(list(st.c5),list(st.c1))
     cs=compute_confluence_score(i1,i5,i15,i1h,i4h,st.fg,sess,adv); mom=compute_momentum_score(i1,i5,i15)
     st.last_conf_score=cs; st.last_mom_score=mom
+    _,_,min_mom=get_session_thresholds(sess["session"])
     token_txt=""
     if not st.paper_mode and poly.ready:
         m=await poly.find_btc_5min_market()
@@ -848,8 +1037,8 @@ async def cmd_score(update,context):
         f"🎯 *SCORE*\n━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"₿`${st.price:,.2f}` | `{sess['session']}`{token_txt}\n\n"
         f"🟢 UP:`{cs['score_up']:.1f}` 🔴 DOWN:`{cs['score_dn']:.1f}`\n"
-        f"Diff:`{cs['diff']:.1f}` → {'✅ TRADEABLE' if cs['tradeable'] else '❌ PASS'}\n"
-        f"⚡ Momentum:`{mom}/10` {mom_e}\n\nSignaux:\n{sigs or '  Aucun'}",parse_mode="Markdown")
+        f"Diff:`{cs['diff']:.1f}/{cs['min_diff']}` → {'✅ TRADEABLE' if cs['tradeable'] else '❌ PASS'}\n"
+        f"⚡ Mom:`{mom}/10` (seuil:`{min_mom}`) {mom_e}\n\nSignaux:\n{sigs or '  Aucun'}",parse_mode="Markdown")
 
 async def cmd_signal(update,context):
     if not auth(update): return
@@ -874,10 +1063,11 @@ async def cmd_signal(update,context):
     dir_e="🟢" if d["dir"]=="UP" else "🔴" if d["dir"]=="DOWN" else "⚪"
     risk_e={"LOW":"🟢","MEDIUM":"🟡","HIGH":"🔴"}.get(d.get("risk","MEDIUM"),"🟡")
     payout=round(1/(tu if d["dir"]=="UP" else td),2) if d["dir"] else 0
+    kelly_info=f" Kelly:`{d.get('kelly_pct',0):.1f}%` (`{d.get('size',0):.2f}$`)" if d.get("trade") else ""
     await update.message.reply_text(
         f"🧠 *ANALYSE*\n━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"{dir_e} *{d['dir'] or 'PASS'}* | {risk_e} | `{d['conf']*100:.0f}%`\n"
-        f"Score:`{cs['score']:.1f}` Mom:`{mom}/10` Payout:x`{payout}`\n"
+        f"Score:`{cs['score']:.1f}` Mom:`{mom}/10` Payout:x`{payout}`{kelly_info}\n"
         f"₿`${i5.get('price',0):,.2f}` | F&G:`{st.fg['value']}` | `{sess['session']}`\n\n"
         f"💭 _{d['reasoning']}_",parse_mode="Markdown")
 
@@ -890,7 +1080,7 @@ async def cmd_ai(update,context):
     await update.message.reply_text(
         f"🧠 *DERNIÈRE DÉCISION*\n━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"{dir_e} *{d.get('dir') or 'PASS'}* | {risk_e} | `{d.get('conf',0)*100:.0f}%`\n"
-        f"Trade:`{'OUI ✅' if d.get('trade') else 'NON ❌'}` | Mise:`{d.get('size',0):.2f}$`\n\n"
+        f"Trade:`{'OUI ✅' if d.get('trade') else 'NON ❌'}` | Mise Kelly:`{d.get('size',0):.2f}$` (`{d.get('kelly_pct',0):.1f}%`)\n\n"
         f"💭 _{d.get('reasoning','—')}_",parse_mode="Markdown")
 
 async def cmd_trades(update,context):
@@ -914,11 +1104,15 @@ async def cmd_stats(update,context):
     rr=aw/al if al>0 else 0
     real_t=[t for t in st.trades if not t.get("paper",True)]
     real_wr=sum(1 for t in real_t if t["result"]=="WIN")/len(real_t)*100 if real_t else 0
+    # Calcul Kelly moyen des trades
+    avg_kelly=sum(t.get("amount",0) for t in st.trades)/len(st.trades) if st.trades else 0
     await update.message.reply_text(
-        f"📉 *STATS*\n━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"📉 *STATS v{BOT_VERSION}*\n━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"Total:`{total}` (✅{st.wins} ❌{st.losses})\nWR:`{wr()}` | ROI:`{roi()}` | R:R:`{rr:.2f}`\n"
         f"PnL:`{fmt(st.pnl)}$` | BR:`{st.bankroll:.2f}$`\n\n"
-        f"💰 Réels:`{len(real_t)}` WR:`{real_wr:.0f}%`\nGain moy:`+{aw:.2f}$` | Perte moy:`-{al:.2f}$`",
+        f"💰 Réels:`{len(real_t)}` WR:`{real_wr:.0f}%`\n"
+        f"Gain moy:`+{aw:.2f}$` | Perte moy:`-{al:.2f}$`\n"
+        f"Mise moy Kelly:`{avg_kelly:.2f}$`",
         parse_mode="Markdown")
 
 async def cmd_passes(update,context):
@@ -944,28 +1138,29 @@ async def cmd_paper(update,context):
     st.paper_mode=not st.paper_mode
     if not st.paper_mode and not poly.ready: poly.init_client()
     await update.message.reply_text(f"Mode:*{'📄 PAPER' if st.paper_mode else '💰 RÉEL ⚠️'}* | API:{'✅' if poly.ready else '❌'}",parse_mode="Markdown")
-    st.save()
+    st.backup()
 
 async def cmd_reset(update,context):
     if not auth(update): return
     st.running=False
-    for j in [st.tick_job,st.price_job,st.macro_job,st.tp_job]:
+    for j in [st.tick_job,st.price_job,st.macro_job,st.tp_job,st.backup_job]:
         if j:
             try: j.schedule_removal()
             except: pass
     st.bankroll=BANKROLL_START; st.trades=[]; st.bet=None
     st.wins=st.losses=st.skipped=st.consec=0; st.pnl=st.streak=st.best_streak=st.worst_streak=0
-    st.cooldown_until=0; st.session_start=time.time(); st.pass_reasons=[]
+    st.cooldown_until=0; st.daily_pause_until=0; st.session_start=time.time(); st.pass_reasons=[]
     st.last_conf_score={}; st.last_mom_score=0; st.active_order_id=None
     st.active_token_id=None; st.shares_bought=0; st.entry_token_price=0
     st.c1.clear(); st.c5.clear(); st.c15.clear(); st.c1h.clear(); st.c4h.clear()
-    if os.path.exists(DATA_FILE): os.remove(DATA_FILE)
+    for f in [DATA_FILE, BACKUP_FILE]:
+        if os.path.exists(f): os.remove(f)
     await update.message.reply_text("🔄 *Reset complet.*",parse_mode="Markdown")
 
 async def cmd_cooldown(update,context):
     if not auth(update): return
-    st.cooldown_until=0; st.consec=0
-    await update.message.reply_text("✅ Cooldown reset.",parse_mode="Markdown")
+    st.cooldown_until=0; st.consec=0; st.daily_pause_until=0
+    await update.message.reply_text("✅ Cooldown + pause reset.",parse_mode="Markdown")
 
 async def cb(update,context):
     q=update.callback_query; await q.answer()
@@ -977,11 +1172,12 @@ def main():
     st.load()
     if not st.paper_mode and POLY_PRIVATE_KEY: poly.init_client()
     app=Application.builder().token(TOKEN).build()
-    for name,handler in [("start",cmd_start),("run",cmd_run),("stop",cmd_stop),("status",cmd_status),
-        ("ai",cmd_ai),("signal",cmd_signal),("score",cmd_score),("trades",cmd_trades),("stats",cmd_stats),
-        ("fear",cmd_fear),("passes",cmd_passes),("market",cmd_market),("balance",cmd_balance),
-        ("paper",cmd_paper),("cooldown",cmd_cooldown),("reset",cmd_reset),
-        ("setbalance",cmd_setbalance)]:
+    for name,handler in [
+        ("start",cmd_start),("run",cmd_run),("stop",cmd_stop),("status",cmd_status),
+        ("ai",cmd_ai),("signal",cmd_signal),("score",cmd_score),("trades",cmd_trades),
+        ("stats",cmd_stats),("fear",cmd_fear),("passes",cmd_passes),("market",cmd_market),
+        ("balance",cmd_balance),("paper",cmd_paper),("cooldown",cmd_cooldown),("reset",cmd_reset),
+        ("setbalance",cmd_setbalance),("backup",cmd_backup)]:
         app.add_handler(CommandHandler(name,handler))
     app.add_handler(CallbackQueryHandler(cb))
     log.info(f"🧠 PolyBot v{BOT_VERSION} démarré")
