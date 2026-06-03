@@ -299,6 +299,8 @@ class PolyClient:
             return None
         # Adresse USDC sur Polygon
         USDC_POLYGON = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
+        # Utilise l'adresse funder (vraie adresse wallet avec les fonds)
+        wallet_addr = os.getenv("POLY_FUNDER_WALLET", POLY_PROXY_WALLET)
         try:
             async with aiohttp.ClientSession() as s:
                 # PolygonScan API — gratuit, pas de clé requise pour balanceOf
@@ -307,7 +309,7 @@ class PolyClient:
                     "module": "account",
                     "action": "tokenbalance",
                     "contractaddress": USDC_POLYGON,
-                    "address": POLY_PROXY_WALLET,
+                    "address": wallet_addr,
                     "tag": "latest",
                     "apikey": "YourApiKeyToken"  # fonctionne sans clé en mode limité
                 }
@@ -328,7 +330,7 @@ class PolyClient:
                     "jsonrpc": "2.0", "method": "eth_call",
                     "params": [{
                         "to": "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174",
-                        "data": f"0x70a08231000000000000000000000000{POLY_PROXY_WALLET[2:].lower().zfill(64)}"
+                        "data": f"0x70a08231000000000000000000000000{wallet_addr[2:].lower().zfill(64)}"
                     }, "latest"],
                     "id": 1
                 }
