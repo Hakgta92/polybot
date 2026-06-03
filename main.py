@@ -127,10 +127,15 @@ class PolyClient:
         """
         Cherche le marché BTC UP/DOWN 5min actif.
         URL Polymarket: /event/btc-updown-5m-XXXXXXXXXX
-        L'API Gamma utilise /events pour ces marchés récurrents.
         """
+        headers = {
+            "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1",
+            "Accept": "application/json",
+            "Referer": "https://polymarket.com/",
+            "Origin": "https://polymarket.com",
+        }
         try:
-            async with aiohttp.ClientSession() as s:
+            async with aiohttp.ClientSession(headers=headers) as s:
 
                 # ── Méthode 1 : /events avec slug btc-updown-5m ──
                 try:
@@ -229,8 +234,9 @@ class PolyClient:
 
     async def get_token_price(self, token_id):
         """Récupère le prix actuel d'un token (0 à 1)"""
+        headers = {"User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15","Referer":"https://polymarket.com/"}
         try:
-            async with aiohttp.ClientSession() as s:
+            async with aiohttp.ClientSession(headers=headers) as s:
                 async with s.get(f"{POLY_HOST}/price",
                                  params={"token_id": token_id, "side": "buy"},
                                  timeout=aiohttp.ClientTimeout(total=5)) as r:
