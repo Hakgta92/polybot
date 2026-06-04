@@ -15,7 +15,7 @@ from collections import deque
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 
-BOT_VERSION = "10.14c"
+BOT_VERSION = "10.14d"
 
 def load_env():
     env_path = os.path.join(os.path.dirname(__file__), '.env')
@@ -1580,6 +1580,38 @@ async def cmd_signal(update,context):
         f"Ξ{eth_e}`{eth_desc}` | `{ob['desc'] if ob else 'N/A'}`\n"
         f"₿`${i5.get('price',0):,.2f}` | F&G:`{st.fg['value']}` | `{sess['session']}`\n\n"
         f"💭 _{d['reasoning']}_",parse_mode="Markdown")
+
+    # ✅ v10.14d — Si Claude dit trade=True, placer l'ordre directement depuis /signal
+    if d.get("trade") and d.get("dir") and not st.bet and not st.paper_mode and st.current_market:
+        amount = d.get("size", 0)
+        if amount >= MIN_BET_USD and st.bankroll >= amount:
+            # Vérifier expiration
+            market_end = 0
+            try:
+                ed = st.current_market.get("end_date", "")
+                if ed:
+                    from datetime import timezone
+                    dt = datetime.fromisoformat(ed.replace("Z", "+00:00"))
+                    market_end = dt.timestamp()
+            except: pass
+            if market_end > 0 and (market_end - time.time()) < 60:
+                await update.message.reply_text("⏰ Slot expire trop tôt — ordre annulé")
+                return
+            token_used = st.current_market["token_up"] if d["dir"]=="UP" else st.current_market["token_down"]
+            entry_tp = tu if d["dir"]=="UP" else td
+            order_id = await poly.place_market_order(token_used, amount, "BUY")
+            if order_id:
+                st.bet = {"dir":d["dir"],"amount":amount,"conf":d["conf"],"entry":st.price,
+                    "reasoning":d["reasoning"],"ts":int(time.time()),"score":cs["score"],"session":sess["session"]}
+                st.active_order_id = order_id; st.active_token_id = token_used
+                st.entry_token_price = entry_tp; st.shares_bought = round(amount/entry_tp,4) if entry_tp>0 else 0
+                st.token_price_peak = 1.0; st.trailing_active = False; st.bet_expiry = market_end
+                await update.message.reply_text(
+                    f"🎯 *Ordre placé depuis /signal !*\n"
+                    f"*{d['dir']}* `{amount:.2f}$` | Token:`{entry_tp:.3f}$`\n"
+                    f"ID:`{order_id}`",parse_mode="Markdown")
+            else:
+                await update.message.reply_text("⚠️ Ordre refusé depuis /signal")
 
 async def cmd_ai(update,context):
     if not auth(update): return
