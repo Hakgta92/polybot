@@ -15,7 +15,7 @@ from collections import deque
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 
-BOT_VERSION = "10.13h"
+BOT_VERSION = "10.14"
 
 def load_env():
     env_path = os.path.join(os.path.dirname(__file__), '.env')
@@ -359,19 +359,47 @@ new Chart(ctx, {{
 # ─── POLYMARKET CLIENT ─────────────────────────────────────────────────────
 class PolyClient:
     def __init__(self):
-        self.client=None; self.ready=False
+        self.client=None; self.ready=False; self.client_version="v1"
 
     def init_client(self):
         if not POLY_PRIVATE_KEY or not POLY_PROXY_WALLET:
             log.warning("Clés Polymarket manquantes"); return False
+        # ✅ v10.14 — Migration vers py-clob-client-v2 (CLOB V2 depuis avril 2026)
+        try:
+            from py_clob_client_v2 import ClobClient as ClobClientV2, ApiCreds
+            self.client = ClobClientV2(
+                host=POLY_HOST,
+                key=POLY_PRIVATE_KEY,
+                chain_id=POLY_CHAIN_ID,
+                signature_type=1,
+                funder=POLY_PROXY_WALLET
+            )
+            creds = self.client.create_or_derive_api_key()
+            self.client = ClobClientV2(
+                host=POLY_HOST,
+                key=POLY_PRIVATE_KEY,
+                chain_id=POLY_CHAIN_ID,
+                signature_type=1,
+                funder=POLY_PROXY_WALLET,
+                creds=creds
+            )
+            self.ready = True
+            self.client_version = "v2"
+            log.info("✅ Polymarket CLOB V2 initialisé"); return True
+        except ImportError:
+            log.warning("py-clob-client-v2 non installé, fallback v1")
+        except Exception as e:
+            log.warning(f"CLOB V2 init: {e}, fallback v1")
+        # Fallback v1
         try:
             from py_clob_client.client import ClobClient
             self.client=ClobClient(POLY_HOST,key=POLY_PRIVATE_KEY,chain_id=POLY_CHAIN_ID,
                 signature_type=1,funder=POLY_PROXY_WALLET)
             creds=self.client.create_or_derive_api_creds()
             self.client.set_api_creds(creds)
-            self.ready=True; log.info("✅ Polymarket CLOB initialisé"); return True
-        except ImportError: log.error("py-clob-client non installé"); return False
+            self.ready=True
+            self.client_version = "v1"
+            log.info("✅ Polymarket CLOB V1 initialisé"); return True
         except Exception as e: log.error(f"Polymarket init: {e}"); return False
 
     async def find_btc_5min_market(self):
@@ -416,33 +444,60 @@ class PolyClient:
 
     async def place_market_order(self,token_id,amount_usdc,side="BUY"):
         if not self.ready or not self.client: return None
-        from py_clob_client.clob_types import MarketOrderArgs, OrderType
 
-        # ✅ v10.13h — side doit être string "BUY"/"SELL" directement
-        # amount doit être float
         amount_float = float(amount_usdc)
-        side_str = "BUY" if side == "BUY" else "SELL"
+        client_version = getattr(self, "client_version", "v1")
 
-        for order_type in [OrderType.FOK, OrderType.GTC, OrderType.FAK]:
+        # ✅ v10.14 — CLOB V2 API
+        if client_version == "v2":
             try:
-                mo = MarketOrderArgs(
-                    token_id=token_id,
-                    amount=amount_float,
-                    side=side_str,
-                    order_type=order_type
+                from py_clob_client_v2 import OrderArgs, OrderType, PartialCreateOrderOptions, Side
+                # V2: on place un limit order au prix du marché
+                # Pour BUY: price proche de 1.0, pour SELL: price proche de 0.0
+                side_v2 = Side.BUY if side == "BUY" else Side.SELL
+                # Calcule price depuis token_price (amount en USDC / shares)
+                price_val = 0.99 if side == "BUY" else 0.01
+                size_val = round(amount_float / price_val, 4) if price_val > 0 else amount_float
+                resp = self.client.create_and_post_order(
+                    order_args=OrderArgs(
+                        token_id=token_id,
+                        price=price_val,
+                        side=side_v2,
+                        size=size_val,
+                    ),
+                    options=PartialCreateOrderOptions(tick_size="0.01"),
+                    order_type=OrderType.FOK,
                 )
-                signed = self.client.create_market_order(mo)
-                resp = self.client.post_order(signed, order_type)
-                log.info(f"Ordre {order_type} réponse: {resp}")
-                if resp and resp.get("success"):
-                    oid = resp.get("orderID", resp.get("id", "unknown"))
-                    log.info(f"✅ Ordre {order_type} placé: {oid}")
-                    return oid
-                else:
-                    log.warning(f"Ordre {order_type} refusé: {resp}")
+                log.info(f"V2 order réponse: {resp}")
+                if resp:
+                    success = resp.get("success", False) or resp.get("orderID") or resp.get("id")
+                    if success:
+                        oid = resp.get("orderID", resp.get("id", "unknown"))
+                        log.info(f"✅ Ordre V2 placé: {oid}")
+                        return oid
+                    log.warning(f"V2 ordre refusé: {resp}")
             except Exception as e:
-                log.warning(f"Ordre {order_type} erreur: {e}")
+                log.error(f"V2 order erreur: {e}")
+            return None
 
+        # Fallback V1
+        try:
+            from py_clob_client.clob_types import MarketOrderArgs, OrderType
+            amount_float = float(amount_usdc)
+            side_str = "BUY" if side == "BUY" else "SELL"
+            for order_type in [OrderType.FOK, OrderType.GTC]:
+                try:
+                    mo = MarketOrderArgs(token_id=token_id, amount=amount_float,
+                        side=side_str, order_type=order_type)
+                    signed = self.client.create_market_order(mo)
+                    resp = self.client.post_order(signed, order_type)
+                    if resp and resp.get("success"):
+                        return resp.get("orderID", resp.get("id", "unknown"))
+                    log.warning(f"V1 {order_type} refusé: {resp}")
+                except Exception as e:
+                    log.warning(f"V1 {order_type} erreur: {e}")
+        except Exception as e:
+            log.error(f"V1 import erreur: {e}")
         return None
 
     async def sell_position(self,token_id,shares):
