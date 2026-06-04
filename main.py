@@ -1,11 +1,12 @@
 """
-POLYMARKET BTC BOT v10.11
+POLYMARKET BTC BOT v10.12
 NOUVEAUTÉS:
-  • /recap — stats des dernières 24h
-  • Trailing stop loss (x1.5 peak → vend à x1.3)
-  • Corrélation BTC/ETH — bonus score si ETH confirme
-  • Liquidations Coinglass — signal fort si grosses liquidations
-  • Orderbook imbalance Binance — biais UP/DOWN selon pression achat/vente
+  • Fix OB: Binance spot /depth (passe sur Railway)
+  • Fix Liq: funding rate + open interest Binance futures
+  • Résumé auto 22h Paris
+  • WR par session sur 7 jours (/stats)
+  • /dashboard HTML PnL + WR
+  • Alerte expiration position réelle
 """
 
 import asyncio, logging, os, json, time, math, aiohttp
@@ -14,7 +15,7 @@ from collections import deque
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 
-BOT_VERSION = "10.11"
+BOT_VERSION = "10.12"
 
 def load_env():
     env_path = os.path.join(os.path.dirname(__file__), '.env')
@@ -44,8 +45,8 @@ MAX_BET_PCT     = 0.08
 KELLY_FRACTION  = 0.25
 
 TAKE_PROFIT_MULT    = 2.0
-TRAILING_PEAK_MULT  = 1.5   # Active trailing stop quand token x1.5
-TRAILING_STOP_MULT  = 1.3   # Vend si retombe sous x1.3 depuis peak
+TRAILING_PEAK_MULT  = 1.5
+TRAILING_STOP_MULT  = 1.3
 TAKE_PROFIT_CHECK   = 30
 POLY_FEE            = 0.02
 MAX_CONSEC_LOSS     = 2
@@ -68,6 +69,7 @@ CLAUDE_API    = "https://api.anthropic.com/v1/messages"
 FEAR_GREED_API= "https://api.alternative.me/fng/?limit=1"
 DATA_FILE     = "polybot_v10_state.json"
 BACKUP_FILE   = "polybot_v10_backup.json"
+DASHBOARD_FILE= "/tmp/polybot_dashboard.html"
 
 logging.basicConfig(format="%(asctime)s [%(levelname)s] %(message)s", level=logging.INFO,
     handlers=[logging.FileHandler("polybot_v10.log"), logging.StreamHandler()])
@@ -81,129 +83,242 @@ def kelly_bet(bankroll, win_prob, payout_mult):
     return round(max(MIN_BET_USD, min(bankroll*min(kp*KELLY_FRACTION, MAX_BET_PCT), MAX_BET_USD)), 2)
 
 # ─── DONNÉES AVANCÉES ──────────────────────────────────────────────────────
-async def fetch_eth_price():
-    """Prix ETH pour corrélation"""
-    try:
-        async with aiohttp.ClientSession() as s:
-            async with s.get("https://api.binance.com/api/v3/ticker/price?symbol=ETHUSDT",
-                             timeout=aiohttp.ClientTimeout(total=5)) as r:
-                if r.status==200:
-                    return float((await r.json())["price"])
-    except: pass
-    return 0.0
-
-async def fetch_eth_klines(interval="5m", limit=30):
-    """Klines ETH pour confirmer direction"""
-    try:
-        async with aiohttp.ClientSession() as s:
-            async with s.get(f"https://api.binance.com/api/v3/klines?symbol=ETHUSDT&interval={interval}&limit={limit}",
-                             timeout=aiohttp.ClientTimeout(total=8)) as r:
-                if r.status==200:
-                    data=await r.json()
-                    if isinstance(data,list) and len(data)>5:
-                        return [{"close":float(k[4]),"open":float(k[1]),"high":float(k[2]),"low":float(k[3]),"vol":float(k[5])} for k in data]
-    except: pass
-    return []
-
 async def fetch_orderbook_imbalance():
     """
-    Orderbook imbalance BTC via Binance.
-    Retourne: {"bias": "UP"/"DOWN"/None, "ratio": 0.0-1.0, "desc": str}
-    ratio > 0.6 = biais UP, < 0.4 = biais DOWN
+    ✅ v10.12 — Binance SPOT /depth (passe sur Railway, pas de restriction).
+    ratio > 0.62 = pression achat → biais UP
+    ratio < 0.38 = pression vente → biais DOWN
     """
     try:
         async with aiohttp.ClientSession() as s:
-            async with s.get("https://api.binance.com/api/v3/depth?symbol=BTCUSDT&limit=20",
-                             timeout=aiohttp.ClientTimeout(total=6)) as r:
-                if r.status==200:
-                    data=await r.json()
-                    bids=sum(float(b[1]) for b in data.get("bids",[]))  # volume achat
-                    asks=sum(float(a[1]) for a in data.get("asks",[]))  # volume vente
-                    total=bids+asks
-                    if total>0:
-                        ratio=round(bids/total,3)
-                        if ratio>0.62:
-                            return {"bias":"UP","ratio":ratio,"desc":f"OB achat {ratio*100:.0f}%"}
-                        elif ratio<0.38:
-                            return {"bias":"DOWN","ratio":ratio,"desc":f"OB vente {(1-ratio)*100:.0f}%"}
+            async with s.get(
+                "https://api.binance.com/api/v3/depth",
+                params={"symbol": "BTCUSDT", "limit": 20},
+                timeout=aiohttp.ClientTimeout(total=6)
+            ) as r:
+                if r.status == 200:
+                    data = await r.json()
+                    bids = sum(float(b[1]) for b in data.get("bids", []))
+                    asks = sum(float(a[1]) for a in data.get("asks", []))
+                    total = bids + asks
+                    if total > 0:
+                        ratio = round(bids / total, 3)
+                        if ratio > 0.62:
+                            return {"bias": "UP", "ratio": ratio, "desc": f"📗 OB achat {ratio*100:.0f}%"}
+                        elif ratio < 0.38:
+                            return {"bias": "DOWN", "ratio": ratio, "desc": f"📕 OB vente {(1-ratio)*100:.0f}%"}
                         else:
-                            return {"bias":None,"ratio":ratio,"desc":f"OB neutre {ratio*100:.0f}%"}
+                            return {"bias": None, "ratio": ratio, "desc": f"OB neutre {ratio*100:.0f}%"}
     except Exception as e:
-        log.warning(f"Orderbook: {e}")
-    return {"bias":None,"ratio":0.5,"desc":"OB indispo"}
+        log.warning(f"OB spot: {e}")
+    return {"bias": None, "ratio": 0.5, "desc": "OB N/A"}
 
 async def fetch_liquidations():
     """
-    Liquidations BTC via Coinglass (pas d'API key requise pour les données basiques).
-    Retourne: {"bias": "UP"/"DOWN"/None, "liq_usd": float, "desc": str}
-    Grosses liquidations SHORT → biais UP (short squeeze)
-    Grosses liquidations LONG → biais DOWN (long liquidation)
+    ✅ v10.12 — Funding rate + Open Interest via Binance Futures (accessible Railway).
+    Funding rate élevé positif = trop de longs = risque baisse
+    Funding rate négatif = trop de shorts = risque hausse
+    OI qui monte avec prix = tendance saine
     """
+    result = {"bias": None, "desc": "Liq N/A"}
     try:
         async with aiohttp.ClientSession() as s:
-            # API publique Coinglass
+            # Funding rate
             async with s.get(
-                "https://open-api.coinglass.com/public/v2/liquidation_history",
-                params={"symbol":"BTC","interval":"1h","limit":1},
-                headers={"accept":"application/json"},
-                timeout=aiohttp.ClientTimeout(total=8)
+                "https://fapi.binance.com/fapi/v1/fundingRate",
+                params={"symbol": "BTCUSDT", "limit": 1},
+                timeout=aiohttp.ClientTimeout(total=6)
             ) as r:
-                if r.status==200:
-                    d=await r.json()
-                    data=d.get("data",[])
+                if r.status == 200:
+                    data = await r.json()
                     if data:
-                        item=data[0]
-                        long_liq=float(item.get("longLiquidationUsd",0))
-                        short_liq=float(item.get("shortLiquidationUsd",0))
-                        total=long_liq+short_liq
-                        if total>5_000_000:  # > 5M$ de liquidations = signal fort
-                            if short_liq>long_liq*1.5:
-                                return {"bias":"UP","liq_usd":total,
-                                        "desc":f"🔥 Short squeeze ${total/1e6:.1f}M"}
-                            elif long_liq>short_liq*1.5:
-                                return {"bias":"DOWN","liq_usd":total,
-                                        "desc":f"🔥 Long liq ${total/1e6:.1f}M"}
-    except Exception as e:
-        log.warning(f"Liquidations Coinglass: {e}")
-
-    # Fallback: futures funding rate Binance comme proxy
-    try:
-        async with aiohttp.ClientSession() as s:
-            async with s.get("https://fapi.binance.com/fapi/v1/fundingRate?symbol=BTCUSDT&limit=1",
-                             timeout=aiohttp.ClientTimeout(total=6)) as r:
-                if r.status==200:
-                    data=await r.json()
-                    if data:
-                        fr=float(data[0].get("fundingRate",0))*100
-                        if fr>0.05:
-                            return {"bias":"DOWN","liq_usd":0,"desc":f"Funding +{fr:.3f}% (longs surpayés)"}
-                        elif fr<-0.05:
-                            return {"bias":"UP","liq_usd":0,"desc":f"Funding {fr:.3f}% (shorts surpayés)"}
+                        fr = float(data[0].get("fundingRate", 0)) * 100
+                        if fr > 0.08:
+                            result = {"bias": "DOWN", "fr": fr, "desc": f"💸 Funding +{fr:.3f}% (longs surexposés)"}
+                        elif fr < -0.08:
+                            result = {"bias": "UP", "fr": fr, "desc": f"💸 Funding {fr:.3f}% (shorts surexposés)"}
+                        elif abs(fr) > 0.03:
+                            bias = "DOWN" if fr > 0 else "UP"
+                            result = {"bias": bias, "fr": fr, "desc": f"Funding {fr:+.3f}%"}
+                        else:
+                            result = {"bias": None, "fr": fr, "desc": f"Funding {fr:+.3f}% (neutre)"}
     except Exception as e:
         log.warning(f"Funding rate: {e}")
 
-    return {"bias":None,"liq_usd":0,"desc":"Liquidations indispo"}
+    # Open Interest en bonus
+    try:
+        async with aiohttp.ClientSession() as s:
+            async with s.get(
+                "https://fapi.binance.com/fapi/v1/openInterest",
+                params={"symbol": "BTCUSDT"},
+                timeout=aiohttp.ClientTimeout(total=6)
+            ) as r:
+                if r.status == 200:
+                    data = await r.json()
+                    oi = float(data.get("openInterest", 0))
+                    result["oi"] = round(oi, 0)
+                    result["desc"] += f" | OI:{oi/1000:.1f}K"
+    except Exception as e:
+        log.warning(f"OI: {e}")
+
+    return result
+
+async def fetch_eth_klines(interval="5m", limit=30):
+    try:
+        async with aiohttp.ClientSession() as s:
+            async with s.get(
+                f"https://api.binance.com/api/v3/klines?symbol=ETHUSDT&interval={interval}&limit={limit}",
+                timeout=aiohttp.ClientTimeout(total=8)
+            ) as r:
+                if r.status == 200:
+                    data = await r.json()
+                    if isinstance(data, list) and len(data) > 5:
+                        return [{"close": float(k[4]), "open": float(k[1]),
+                                 "high": float(k[2]), "low": float(k[3]), "vol": float(k[5])} for k in data]
+    except: pass
+    return []
 
 def compute_eth_correlation(eth_klines, btc_direction):
-    """
-    Compare la direction ETH avec BTC pour confirmer ou infirmer.
-    Retourne bonus score (+1.5 si confirme, -1 si diverge, 0 si neutre)
-    """
-    if not eth_klines or len(eth_klines)<5:
-        return 0, "ETH: données indispo"
-    closes=[c["close"] for c in eth_klines]
-    e9=sum(closes[-9:])/min(9,len(closes))
-    e21=sum(closes[-21:])/min(21,len(closes)) if len(closes)>=21 else closes[0]
-    eth_bull=e9>e21
-    change_pct=(closes[-1]-closes[-5])/closes[-5]*100 if closes[-5]>0 else 0
-    eth_dir="UP" if eth_bull else "DOWN"
-    if eth_dir==btc_direction:
-        bonus=1.5
-        desc=f"ETH confirme {eth_dir} ({change_pct:+.2f}%)"
+    if not eth_klines or len(eth_klines) < 5:
+        return 0, "ETH N/A"
+    closes = [c["close"] for c in eth_klines]
+    e9 = sum(closes[-9:]) / min(9, len(closes))
+    e21 = sum(closes[-21:]) / min(21, len(closes)) if len(closes) >= 21 else closes[0]
+    eth_dir = "UP" if e9 > e21 else "DOWN"
+    change = (closes[-1] - closes[-5]) / closes[-5] * 100 if closes[-5] > 0 else 0
+    if eth_dir == btc_direction:
+        return 1.5, f"Ξ confirme {eth_dir} ({change:+.2f}%)"
     else:
-        bonus=-1.0
-        desc=f"ETH diverge {eth_dir} vs BTC {btc_direction}"
-    return bonus, desc
+        return -1.0, f"Ξ diverge {eth_dir} ({change:+.2f}%)"
+
+# ─── DASHBOARD HTML ────────────────────────────────────────────────────────
+def generate_dashboard(trades, bankroll, bankroll_ref, pnl):
+    """Génère un dashboard HTML avec graphique PnL et stats"""
+    now = datetime.now().strftime("%d/%m/%Y %H:%M")
+    roi = round((bankroll - bankroll_ref) / bankroll_ref * 100, 2) if bankroll_ref > 0 else 0
+
+    # Données PnL cumulé
+    cumul = 0; pnl_points = []
+    for t in sorted(trades, key=lambda x: x.get("ts", 0)):
+        cumul += t["pnl"]
+        ts = datetime.fromtimestamp(t.get("ts", 0)).strftime("%d/%m %H:%M")
+        pnl_points.append({"x": ts, "y": round(cumul, 2)})
+
+    # WR par session
+    sessions = {}
+    for t in trades:
+        s = t.get("session", "?")
+        if s not in sessions: sessions[s] = {"w": 0, "l": 0}
+        if t["result"] == "WIN": sessions[s]["w"] += 1
+        else: sessions[s]["l"] += 1
+
+    sess_rows = ""
+    for s, v in sessions.items():
+        total_s = v["w"] + v["l"]
+        wr_s = v["w"] / total_s * 100 if total_s > 0 else 0
+        color = "#4CAF50" if wr_s >= 50 else "#f44336"
+        sess_rows += f'<tr><td>{s}</td><td>{v["w"]}</td><td>{v["l"]}</td><td style="color:{color}">{wr_s:.0f}%</td></tr>'
+
+    # Derniers trades
+    trade_rows = ""
+    for t in sorted(trades, key=lambda x: x.get("ts", 0), reverse=True)[:10]:
+        ts = datetime.fromtimestamp(t.get("ts", 0)).strftime("%d/%m %H:%M")
+        color = "#4CAF50" if t["pnl"] >= 0 else "#f44336"
+        emoji = "✅" if t["result"] == "WIN" else "❌"
+        trade_rows += f'<tr><td>{emoji}</td><td>{t["dir"]}</td><td style="color:{color}">{t["pnl"]:+.2f}$</td><td>{ts}</td></tr>'
+
+    labels = json.dumps([p["x"] for p in pnl_points])
+    data_vals = json.dumps([p["y"] for p in pnl_points])
+    total = len(trades)
+    wins = sum(1 for t in trades if t["result"] == "WIN")
+    wr = round(wins / total * 100, 1) if total > 0 else 0
+
+    html = f"""<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PolyBot v{BOT_VERSION} Dashboard</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+<style>
+  body{{font-family:Arial,sans-serif;background:#1a1a2e;color:#eee;margin:0;padding:20px}}
+  .card{{background:#16213e;border-radius:12px;padding:20px;margin:10px 0}}
+  .grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px}}
+  .stat{{background:#0f3460;border-radius:8px;padding:15px;text-align:center}}
+  .stat .val{{font-size:24px;font-weight:bold;color:#e94560}}
+  .stat .lbl{{font-size:12px;color:#aaa;margin-top:5px}}
+  table{{width:100%;border-collapse:collapse}}
+  th,td{{padding:8px;border-bottom:1px solid #333;text-align:left;font-size:13px}}
+  th{{color:#aaa}}
+  h2{{color:#e94560;margin-top:0}}
+  .positive{{color:#4CAF50}} .negative{{color:#f44336}}
+</style>
+</head>
+<body>
+<h1>🧠 PolyBot v{BOT_VERSION} — Dashboard</h1>
+<p style="color:#aaa">Généré le {now}</p>
+
+<div class="card">
+<div class="grid">
+  <div class="stat"><div class="val {'positive' if roi>=0 else 'negative'}">{roi:+.2f}%</div><div class="lbl">ROI</div></div>
+  <div class="stat"><div class="val">{bankroll:.2f}$</div><div class="lbl">Bankroll</div></div>
+  <div class="stat"><div class="val {'positive' if pnl>=0 else 'negative'}">{pnl:+.2f}$</div><div class="lbl">PnL Session</div></div>
+  <div class="stat"><div class="val">{wr}%</div><div class="lbl">Win Rate</div></div>
+  <div class="stat"><div class="val">{total}</div><div class="lbl">Trades</div></div>
+  <div class="stat"><div class="val">{wins}</div><div class="lbl">Wins</div></div>
+</div>
+</div>
+
+<div class="card">
+<h2>📈 PnL Cumulé</h2>
+<canvas id="pnlChart" height="100"></canvas>
+</div>
+
+<div class="card">
+<h2>📊 WR par Session</h2>
+<table>
+<tr><th>Session</th><th>✅ Wins</th><th>❌ Losses</th><th>WR</th></tr>
+{sess_rows}
+</table>
+</div>
+
+<div class="card">
+<h2>📋 Derniers Trades</h2>
+<table>
+<tr><th></th><th>Dir</th><th>PnL</th><th>Date</th></tr>
+{trade_rows}
+</table>
+</div>
+
+<script>
+const ctx = document.getElementById('pnlChart').getContext('2d');
+new Chart(ctx, {{
+  type: 'line',
+  data: {{
+    labels: {labels},
+    datasets: [{{
+      label: 'PnL Cumulé ($)',
+      data: {data_vals},
+      borderColor: '#e94560',
+      backgroundColor: 'rgba(233,69,96,0.1)',
+      fill: true,
+      tension: 0.4,
+      pointRadius: 3
+    }}]
+  }},
+  options: {{
+    responsive: true,
+    plugins: {{ legend: {{ labels: {{ color: '#eee' }} }} }},
+    scales: {{
+      x: {{ ticks: {{ color: '#aaa', maxTicksLimit: 10 }}, grid: {{ color: '#333' }} }},
+      y: {{ ticks: {{ color: '#aaa' }}, grid: {{ color: '#333' }} }}
+    }}
+  }}
+}});
+</script>
+</body>
+</html>"""
+    return html
 
 # ─── POLYMARKET CLIENT ─────────────────────────────────────────────────────
 class PolyClient:
@@ -509,27 +624,20 @@ def compute_confluence_score(i1,i5,i15,i1h,i4h,fg,sess,adv,ob=None,liq=None,eth_
         else: dn+=0.5
     if i5.get("consolidation"):
         up*=0.8; dn*=0.8; signals.append("⚠️ Consolidation")
-
-    # ✅ Orderbook imbalance
     if ob and ob.get("bias"):
-        if ob["bias"]=="UP": up+=1.5; signals.append(f"📗 {ob['desc']}")
-        elif ob["bias"]=="DOWN": dn+=1.5; signals.append(f"📕 {ob['desc']}")
-
-    # ✅ Liquidations
+        if ob["bias"]=="UP": up+=1.5; signals.append(ob["desc"])
+        elif ob["bias"]=="DOWN": dn+=1.5; signals.append(ob["desc"])
     if liq and liq.get("bias"):
-        if liq["bias"]=="UP": up+=2.0; signals.append(f"💥 {liq['desc']}")
-        elif liq["bias"]=="DOWN": dn+=2.0; signals.append(f"💥 {liq['desc']}")
-
-    # ✅ Corrélation ETH
+        if liq["bias"]=="UP": up+=2.0; signals.append(liq["desc"])
+        elif liq["bias"]=="DOWN": dn+=2.0; signals.append(liq["desc"])
     if eth_bonus!=0:
         if eth_bonus>0:
             if up>dn: up+=eth_bonus
-            else: dn+=eth_bonus  # confirme la direction dominante
-        else:
-            if up>dn: up+=eth_bonus  # pénalise si ETH diverge
             else: dn+=eth_bonus
-        if eth_desc: signals.append(f"Ξ {eth_desc}")
-
+        else:
+            if up>dn: up+=eth_bonus
+            else: dn+=eth_bonus
+        if eth_desc: signals.append(eth_desc)
     direction="UP" if up>=dn else "DOWN"
     score=round(up if up>=dn else dn,1); diff=round(abs(up-dn),1)
     min_score,min_diff,min_mom=get_session_thresholds(sess.get("session","OVERNIGHT"))
@@ -585,6 +693,19 @@ def is_trending(c5,c15):
     closes=[c["close"] for c in c5[-12:]]; highs=[c["high"] for c in c5[-6:]]
     lows=[c["low"] for c in c5[-6:]]; price=closes[-1] if closes[-1] else 1
     return (max(highs)-min(lows))/price*100>thr or abs(closes[-1]-closes[0])/price*100>thr*0.7
+
+def wr_by_session(trades, days=7):
+    """WR par session sur les N derniers jours"""
+    cutoff=time.time()-days*86400
+    recent=[t for t in trades if t.get("ts",0)>=cutoff]
+    sessions={}
+    for t in recent:
+        s=t.get("session","?")
+        if s not in sessions: sessions[s]={"w":0,"l":0,"pnl":0}
+        if t["result"]=="WIN": sessions[s]["w"]+=1
+        else: sessions[s]["l"]+=1
+        sessions[s]["pnl"]+=t["pnl"]
+    return sessions
 
 async def fetch_price():
     sources=[("Kraken","https://api.kraken.com/0/public/Ticker?pair=XBTUSD",lambda d:float(d["result"]["XXBTZUSD"]["c"][0])),
@@ -657,8 +778,8 @@ async def claude_decide(i1,i5,i15,i1h,i4h,adv,trades,bankroll,consec,fg,btc24,se
     i4h_txt=f"4h RSI:{i4h.get('rsi_14',50)} EMA:{'↑' if i4h.get('ema_bull') else '↓'}" if i4h else ""
     h_paris=(datetime.utcnow().hour+2)%24
     min_score,min_diff,min_mom=get_session_thresholds(sess.get("session","OVERNIGHT"))
-    ob_txt=f"OB:{ob['desc']}" if ob else "OB:indispo"
-    liq_txt=f"LIQ:{liq['desc']}" if liq else "LIQ:indispo"
+    ob_txt=ob["desc"] if ob else "OB N/A"
+    liq_txt=liq["desc"] if liq else "Liq N/A"
     prompt=f"""Expert trading binaire BTC UP/DOWN 5min Polymarket. Bets RÉELS.
 BTC:${i5.get('price',0):,.2f} | 24h:{btc24.get('change_pct',0):+.2f}% | F&G:{fg['value']}/100 | {sess['session']} {h_paris}h
 UP:{tpu:.3f}$→x{ppu}(Kelly≈{kelly_up:.2f}$) | DOWN:{tpd:.3f}$→x{ppd}(Kelly≈{kelly_dn:.2f}$)
@@ -715,12 +836,11 @@ class State:
         self.skipped=0; self.pass_reasons=[]
         self.last_decision={}; self.last_conf_score={}; self.last_mom_score=0
         self.fg={"value":50,"label":"Neutral"}; self.btc24={}
-        self.tick_job=self.price_job=self.macro_job=self.tp_job=self.backup_job=None
+        self.tick_job=self.price_job=self.macro_job=self.tp_job=self.backup_job=self.recap_job=None
         self.current_market=None; self.active_order_id=None; self.active_token_id=None
         self.entry_token_price=0.0; self.shares_bought=0.0
-        self.token_price_peak=0.0    # ✅ Peak pour trailing stop
-        self.trailing_active=False   # ✅ Trailing stop activé?
-        # Cache données avancées
+        self.token_price_peak=0.0; self.trailing_active=False
+        self.bet_expiry=0  # timestamp expiration du bet réel
         self.last_ob=None; self.last_liq=None; self.last_eth_klines=[]
 
     def save(self):
@@ -740,7 +860,7 @@ class State:
         try:
             data=self.save()
             with open(BACKUP_FILE,"w") as f: json.dump(data,f,indent=2)
-            log.info(f"✅ Backup — BR:{self.bankroll:.2f}"); return True
+            log.info(f"✅ Backup BR:{self.bankroll:.2f}"); return True
         except Exception as e: log.error(f"Backup: {e}"); return False
 
     def load(self):
@@ -759,7 +879,7 @@ class State:
                     self.paper_mode=d.get("paper_mode",PAPER_MODE)
                     self.skipped=d.get("skipped",0); self.pass_reasons=d.get("pass_reasons",[])
                     age=int((time.time()-d.get("saved_at",0))/60)
-                    log.info(f"✅ State chargé {filepath} ({age}min) BR:{self.bankroll:.2f}"); return
+                    log.info(f"✅ State {filepath} ({age}min) BR:{self.bankroll:.2f}"); return
             except Exception as e: log.error(f"Load {filepath}: {e}")
 
 st=State()
@@ -768,6 +888,12 @@ def roi():
     if st.bankroll_ref<=0: return "+0.00%"
     pct=(st.bankroll-st.bankroll_ref)/st.bankroll_ref*100
     return f"+{pct:.2f}%" if pct>=0 else f"{pct:.2f}%"
+
+def fmt(v): return f"+{v:.2f}" if v>=0 else f"{v:.2f}"
+def wr():
+    t=st.wins+st.losses; return f"{st.wins/t*100:.1f}%" if t else "—"
+def upt():
+    s=int(time.time()-st.session_start); return f"{s//3600:02d}:{(s%3600)//60:02d}:{s%60:02d}"
 
 def check_daily():
     now=time.time()
@@ -789,37 +915,63 @@ async def send(bot,text,parse_mode="Markdown"):
         try: await bot.send_message(chat_id=ALLOWED_UID,text=text.replace("*","").replace("`","").replace("_","")); return True
         except: return False
 
+# ─── JOBS ──────────────────────────────────────────────────────────────────
 async def job_backup(context):
     st.backup()
 
+async def job_daily_recap(context):
+    """✅ v10.12 — Résumé automatique tous les jours à 22h Paris"""
+    h_paris=(datetime.utcnow().hour+2)%24
+    if h_paris!=22: return  # Tourne toutes les heures, envoie seulement à 22h
+    now=time.time(); cutoff=now-86400
+    trades_24h=[t for t in st.trades if t.get("ts",0)>=cutoff]
+    if not trades_24h:
+        await send(context.bot,f"📊 *Récap 22h* — Aucun trade aujourd'hui.\nBR:`{st.bankroll:.2f}$` | ROI:`{roi()}`")
+        return
+    wins=[t for t in trades_24h if t["result"]=="WIN"]
+    losses=[t for t in trades_24h if t["result"]=="LOSS"]
+    pnl_24h=sum(t["pnl"] for t in trades_24h)
+    wr_24h=len(wins)/len(trades_24h)*100
+    sessions_wr=wr_by_session(trades_24h,1)
+    best_sess=max(sessions_wr.items(),key=lambda x:x[1]["w"]/(x[1]["w"]+x[1]["l"]) if (x[1]["w"]+x[1]["l"])>0 else 0)[0] if sessions_wr else "?"
+    await send(context.bot,
+        f"📊 *RÉCAP JOURNALIER 22h*\n━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"Trades:`{len(trades_24h)}` (✅{len(wins)} ❌{len(losses)})\n"
+        f"WR:`{wr_24h:.1f}%` | PnL:`{fmt(pnl_24h)}$`\n"
+        f"BR:`{st.bankroll:.2f}$` | ROI:`{roi()}`\n"
+        f"Meilleure session: `{best_sess}`\n\n"
+        f"_Bot continue demain — bonne nuit 🌙_")
+
+async def job_check_expiry(context):
+    """✅ v10.12 — Alerte 1min avant expiration d'un bet réel"""
+    if not st.bet or st.paper_mode or st.bet_expiry<=0: return
+    remaining=st.bet_expiry-time.time()
+    if 50<=remaining<=70:  # Entre 50s et 70s avant expiration
+        current_price=await poly.get_token_price(st.active_token_id) if st.active_token_id else 0
+        gain_mult=current_price/st.entry_token_price if st.entry_token_price>0 and current_price>0 else 0
+        await send(context.bot,
+            f"⏰ *Position expire dans ~1min*\n"
+            f"`{st.bet['dir']}` | Token:`{current_price:.3f}$` | x`{gain_mult:.2f}`\n"
+            f"BTC:`${st.price:,.2f}`")
+
 async def job_take_profit(context):
-    """
-    ✅ v10.11 — Trailing stop loss.
-    - Si token atteint x1.5 (TRAILING_PEAK_MULT) → active le trailing
-    - Si retombe sous x1.3 (TRAILING_STOP_MULT) depuis le peak → vend
-    - Si atteint x2.0 (TAKE_PROFIT_MULT) → vend directement
-    """
     if not st.bet or not st.active_token_id or st.paper_mode: return
     try:
         current_price=await poly.get_token_price(st.active_token_id)
         if current_price<=0 or st.entry_token_price<=0: return
         gain_mult=current_price/st.entry_token_price
-
-        # Met à jour le peak
         if gain_mult>st.token_price_peak:
             st.token_price_peak=gain_mult
             if gain_mult>=TRAILING_PEAK_MULT and not st.trailing_active:
                 st.trailing_active=True
-                log.info(f"🎯 Trailing stop activé à x{gain_mult:.2f}")
-
-        # Take profit direct
+                await send(context.bot,f"🎯 *Trailing stop activé* x`{gain_mult:.2f}`\nVente auto si retombe sous x`{TRAILING_STOP_MULT:.1f}`")
         sell_reason=None
         if gain_mult>=TAKE_PROFIT_MULT:
             sell_reason=f"Take profit x{gain_mult:.2f}"
-        # Trailing stop
-        elif st.trailing_active and gain_mult<st.token_price_peak*TRAILING_STOP_MULT/TRAILING_PEAK_MULT:
-            sell_reason=f"Trailing stop (peak x{st.token_price_peak:.2f} → x{gain_mult:.2f})"
-
+        elif st.trailing_active and st.token_price_peak>0:
+            trail_threshold=max(TRAILING_STOP_MULT, st.token_price_peak*0.87)
+            if gain_mult<trail_threshold:
+                sell_reason=f"Trailing stop (peak x{st.token_price_peak:.2f}→x{gain_mult:.2f})"
         if sell_reason:
             result=await poly.sell_position(st.active_token_id,st.shares_bought)
             if result:
@@ -831,12 +983,13 @@ async def job_take_profit(context):
                 st.trades.append({"dir":bet["dir"],"amount":bet["amount"],"pnl":round(gross,4),
                     "conf":bet["conf"],"result":"WIN","entry":bet["entry"],"exit":st.price,
                     "reasoning":sell_reason,"paper":False,"ts":int(time.time()),
-                    "score":bet.get("score",0),"fg_value":st.fg.get("value",50),"aligned_15h1h":True})
+                    "score":bet.get("score",0),"fg_value":st.fg.get("value",50),"aligned_15h1h":True,
+                    "session":bet.get("session","?")})
                 st.bet=None; st.active_token_id=None; st.active_order_id=None
                 st.shares_bought=0; st.entry_token_price=0
-                st.token_price_peak=0; st.trailing_active=False
+                st.token_price_peak=0; st.trailing_active=False; st.bet_expiry=0
                 await send(context.bot,
-                    f"🎯 *VENTE POSITION*\n`{sell_reason}`\n"
+                    f"🎯 *VENTE* — {sell_reason}\n"
                     f"`{bet['dir']}` | `+{gross:.2f} USDC`\nBR:`{st.bankroll:.2f}` | ROI:`{roi()}`")
                 st.backup()
     except Exception as e: log.error(f"job_take_profit: {e}")
@@ -847,7 +1000,6 @@ async def job_price(context):
 
 async def job_macro(context):
     st.fg=await fetch_fear_greed(); st.btc24=await fetch_btc_24h()
-    # Refresh données avancées toutes les 5min avec le macro
     try: st.last_ob=await fetch_orderbook_imbalance()
     except: pass
     try: st.last_liq=await fetch_liquidations()
@@ -887,8 +1039,9 @@ async def job_tick(context):
                 "conf":bet["conf"],"result":"WIN" if won else "LOSS","entry":bet["entry"],"exit":st.price,
                 "reasoning":bet.get("reasoning",""),"paper":True,"ts":int(time.time()),
                 "score":bet.get("score",0),"fg_value":st.fg.get("value",50),
+                "session":bet.get("session","?"),
                 "aligned_15h1h":i15_n.get("ema_bull")==i1h_n.get("ema_bull")})
-            st.bet=None; st.token_price_peak=0; st.trailing_active=False
+            st.bet=None; st.token_price_peak=0; st.trailing_active=False; st.bet_expiry=0
             cd_msg=f"\n⏸ Cooldown {COOLDOWN_MIN}min" if in_cd() else ""
             await send(context.bot,f"{'✅' if won else '❌'} *Trade clôturé* [📄]\n`{bet['dir']}` `${bet['entry']:,.0f}`→`${st.price:,.0f}`\nPnL:`{'+' if gross>=0 else ''}{gross:.2f}$` BR:`{st.bankroll:.2f}` ROI:`{roi()}`{cd_msg}")
             st.backup()
@@ -899,13 +1052,9 @@ async def job_tick(context):
     sess=session_ctx()
     if not i5: return
     adv=compute_advanced_signals(list(st.c5),list(st.c1))
-    # ETH corrélation
-    eth_bonus=0; eth_desc="N/A"
     direction_guess="UP" if i5.get("ema_bull") else "DOWN"
-    if st.last_eth_klines:
-        eth_bonus,eth_desc=compute_eth_correlation(st.last_eth_klines,direction_guess)
-    conf_score=compute_confluence_score(i1,i5,i15,i1h,i4h,st.fg,sess,adv,
-                                        st.last_ob,st.last_liq,eth_bonus,eth_desc)
+    eth_bonus,eth_desc=compute_eth_correlation(st.last_eth_klines,direction_guess) if st.last_eth_klines else (0,"N/A")
+    conf_score=compute_confluence_score(i1,i5,i15,i1h,i4h,st.fg,sess,adv,st.last_ob,st.last_liq,eth_bonus,eth_desc)
     mom_score=compute_momentum_score(i1,i5,i15)
     st.last_conf_score=conf_score; st.last_mom_score=mom_score
     _,_,min_mom=get_session_thresholds(sess.get("session","OVERNIGHT"))
@@ -915,18 +1064,25 @@ async def job_tick(context):
         st.skipped+=1; st.pass_reasons.append({"ts":int(time.time()),"reason":f"Mom {mom_score}<{min_mom}"}); return
     if i5.get("atr_pct",0)<0.03: st.skipped+=1; return
     if i5.get("vol_ratio",1)<0.4: st.skipped+=1; return
-    tpu=0.5; tpd=0.5
+    tpu=0.5; tpd=0.5; market_end=0
     if not st.paper_mode:
         market=await poly.find_btc_5min_market()
         if market:
             st.current_market=market
             tpu=await poly.get_token_price(market["token_up"])
             tpd=await poly.get_token_price(market["token_down"])
+            # Parse end_date pour alerte expiration
+            try:
+                from datetime import timezone
+                ed=market.get("end_date","")
+                if ed:
+                    dt=datetime.fromisoformat(ed.replace("Z","+00:00"))
+                    market_end=dt.timestamp()
+            except: pass
         else:
             st.skipped+=1; st.pass_reasons.append({"ts":int(time.time()),"reason":"Aucun marché actif"}); return
     dec=await claude_decide(i1,i5,i15,i1h,i4h,adv,st.trades[-15:],st.bankroll,st.consec,
-                            st.fg,st.btc24,sess,conf_score,mom_score,tpu,tpd,
-                            st.last_ob,st.last_liq,eth_desc)
+                            st.fg,st.btc24,sess,conf_score,mom_score,tpu,tpd,st.last_ob,st.last_liq,eth_desc)
     st.last_decision=dec
     if dec["trade"] and dec["dir"] and not st.bet:
         amount=dec["size"]
@@ -942,30 +1098,26 @@ async def job_tick(context):
                 await send(context.bot,"⚠️ *Ordre Polymarket refusé*"); return
             st.active_order_id=order_id; st.active_token_id=token_used
             st.entry_token_price=entry_tp; st.shares_bought=round(amount/entry_tp,4) if entry_tp>0 else 0
-            st.token_price_peak=1.0; st.trailing_active=False  # Reset trailing
+            st.token_price_peak=1.0; st.trailing_active=False
+            st.bet_expiry=market_end  # ✅ Timestamp expiration pour alerte
         st.bet={"dir":dec["dir"],"amount":amount,"conf":dec["conf"],"entry":st.price,
                 "reasoning":dec["reasoning"],"ts":int(time.time()),"score":conf_score["score"],"session":sess["session"]}
         mode="💰 RÉEL" if not st.paper_mode else "📄 paper"
         risk_e={"LOW":"🟢","MEDIUM":"🟡","HIGH":"🔴"}.get(dec["risk"],"🟡")
         sigs="\n".join(f"  • {s}" for s in conf_score["signals"][:5])
-        pinfo=f"\nToken:`{entry_tp:.3f}$`→x`{round(1/entry_tp,2) if entry_tp>0 else '?'}` TP:x`{TAKE_PROFIT_MULT}` Trail:x`{TRAILING_PEAK_MULT}`→x`{TRAILING_STOP_MULT}`" if not st.paper_mode else ""
-        ob_info=f"\n📊 {st.last_ob['desc']}" if st.last_ob else ""
-        liq_info=f"\n💥 {st.last_liq['desc']}" if st.last_liq and st.last_liq.get("bias") else ""
+        pinfo=f"\nToken:`{entry_tp:.3f}$`→x`{round(1/entry_tp,2) if entry_tp>0 else '?'}` TP:x`{TAKE_PROFIT_MULT}` Trail:x`{TRAILING_PEAK_MULT}`" if not st.paper_mode else ""
+        ob_info=f"\n{st.last_ob['desc']}" if st.last_ob and st.last_ob.get("bias") else ""
         await send(context.bot,
             f"🧠 *Bet placé* [{mode}]\n━━━━━━━━━━━━━━━\n"
             f"*{dec['dir']}* | `{amount:.2f}$` Kelly:`{dec.get('kelly_pct',0):.1f}%` | `{dec['conf']*100:.0f}%` | {risk_e}\n"
             f"Score:`{conf_score['score']:.1f}` Mom:`{mom_score}/10`{pinfo}\n"
-            f"BTC:`${st.price:,.2f}` | ETH:`{eth_desc}`{ob_info}{liq_info}\n\n"
+            f"BTC:`${st.price:,.2f}` | `{sess['session']}`\n"
+            f"Ξ`{eth_desc}`{ob_info}\n\n"
             f"💭 _{dec['reasoning']}_\n🔑 Signaux:\n{sigs}")
     else:
         st.skipped+=1; st.pass_reasons.append({"ts":int(time.time()),"reason":f"Claude PASS:{dec['reasoning'][:50]}"})
 
 def auth(u): return ALLOWED_UID==0 or u.effective_user.id==ALLOWED_UID
-def fmt(v): return f"+{v:.2f}" if v>=0 else f"{v:.2f}"
-def wr():
-    t=st.wins+st.losses; return f"{st.wins/t*100:.1f}%" if t else "—"
-def upt():
-    s=int(time.time()-st.session_start); return f"{s//3600:02d}:{(s%3600)//60:02d}:{s%60:02d}"
 
 def kb():
     return InlineKeyboardMarkup([
@@ -983,13 +1135,15 @@ async def cmd_start(update,context):
         f"🧠 *POLYMARKET BOT v{BOT_VERSION}*\n━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"Mode:*{'📄 PAPER' if st.paper_mode else '💰 RÉEL'}* | API:{'✅' if poly.ready else '❌'}\n"
         f"Wallet:`{w[:6]}...{w[-4:]}`\n\n"
-        f"🆕 v10.11:\n"
-        f"  ✅ Trailing stop (x1.5→x1.3)\n"
-        f"  ✅ Corrélation ETH bonus score\n"
-        f"  ✅ Liquidations + Orderbook\n"
-        f"  ✅ /recap stats 24h\n\n"
+        f"🆕 v10.12:\n"
+        f"  ✅ OB via Binance spot (Railway OK)\n"
+        f"  ✅ Liq via Binance futures funding\n"
+        f"  ✅ Résumé auto 22h Paris\n"
+        f"  ✅ Alerte expiration position\n"
+        f"  ✅ WR par session 7j\n"
+        f"  ✅ /dashboard HTML\n\n"
         f"*/run* */stop* */status* */signal* */score*\n"
-        f"*/market* */balance* */trades* */recap*\n"
+        f"*/market* */balance* */trades* */recap* */dashboard*\n"
         f"*/setbalance 55.11* • */backup*",
         parse_mode="Markdown",reply_markup=kb())
 
@@ -1007,8 +1161,10 @@ async def cmd_run(update,context):
     st.tick_job=context.job_queue.run_repeating(job_tick,interval=300,first=15)
     st.tp_job=context.job_queue.run_repeating(job_take_profit,interval=TAKE_PROFIT_CHECK,first=10)
     st.backup_job=context.job_queue.run_repeating(job_backup,interval=600,first=60)
+    st.recap_job=context.job_queue.run_repeating(job_daily_recap,interval=3600,first=60)
+    # Alerte expiration toutes les 30s
+    context.job_queue.run_repeating(job_check_expiry,interval=30,first=15)
     st.fg=await fetch_fear_greed(); st.btc24=await fetch_btc_24h(); sess=session_ctx()
-    # Init données avancées
     st.last_ob=await fetch_orderbook_imbalance()
     st.last_liq=await fetch_liquidations()
     st.last_eth_klines=await fetch_eth_klines("5m",30)
@@ -1019,30 +1175,30 @@ async def cmd_run(update,context):
         f"▶️ *Bot v{BOT_VERSION} démarré !*\nMode:*{'📄 PAPER' if st.paper_mode else '💰 RÉEL'}*\n"
         f"Session:`{sess['session']}` | Seuils: score≥`{min_score}` mom≥`{min_mom}`\n"
         f"BR:`{st.bankroll:.2f}$` | ROI:`{roi()}`\n"
-        f"📊 OB:`{ob_txt}` | 💥 Liq:`{liq_txt}`",
+        f"📊 `{ob_txt}` | 💸 `{liq_txt}`\n"
+        f"Récap auto: 22h Paris 🕙",
         parse_mode="Markdown")
     await job_tick(context)
 
 async def cmd_stop(update,context):
     if not auth(update): return
     st.running=False
-    for j in [st.tick_job,st.price_job,st.macro_job,st.tp_job,st.backup_job]:
+    for j in [st.tick_job,st.price_job,st.macro_job,st.tp_job,st.backup_job,st.recap_job]:
         if j:
             try: j.schedule_removal()
             except: pass
-    st.tick_job=st.price_job=st.macro_job=st.tp_job=st.backup_job=None
+    st.tick_job=st.price_job=st.macro_job=st.tp_job=st.backup_job=st.recap_job=None
     st.backup()
     await update.message.reply_text(
-        f"⏹ *Arrêté* | `{upt()}` | BR:`{st.bankroll:.2f}` | ROI:`{roi()}` | WR:`{wr()}`\n💾 Backup sauvegardé.",
+        f"⏹ *Arrêté* | `{upt()}` | BR:`{st.bankroll:.2f}` | ROI:`{roi()}` | WR:`{wr()}`\n💾 Backup OK.",
         parse_mode="Markdown")
 
 async def cmd_recap(update,context):
-    """✅ v10.11 — Stats des dernières 24h"""
     if not auth(update): return
     now=time.time(); cutoff=now-86400
     trades_24h=[t for t in st.trades if t.get("ts",0)>=cutoff]
     if not trades_24h:
-        await update.message.reply_text("📊 Aucun trade dans les dernières 24h."); return
+        await update.message.reply_text("📊 Aucun trade dans les 24 dernières heures."); return
     wins=[t for t in trades_24h if t["result"]=="WIN"]
     losses=[t for t in trades_24h if t["result"]=="LOSS"]
     pnl_24h=sum(t["pnl"] for t in trades_24h)
@@ -1067,11 +1223,28 @@ async def cmd_recap(update,context):
         f"Trades:`{len(trades_24h)}` (✅{len(wins)} ❌{len(losses)})\n"
         f"WR:`{wr_24h:.1f}%` | PnL:`{fmt(pnl_24h)}$`\n"
         f"Gain moy:`+{avg_win:.2f}$` | Perte moy:`-{avg_loss:.2f}$`\n\n"
-        f"🟢 UP:`{up_wr:.0f}%`({len(up_t)}) 🔴 DOWN:`{dn_wr:.0f}%`({len(dn_t)})\n\n"
+        f"🟢 UP:`{up_wr:.0f}%`({len(up_t)}) | 🔴 DOWN:`{dn_wr:.0f}%`({len(dn_t)})\n\n"
         f"🏆 Meilleur:`{fmt(best['pnl'])}$` {best['dir']}\n"
         f"💀 Pire:`{fmt(worst['pnl'])}$` {worst['dir']}\n\n"
         f"Par session:\n{sess_txt}",
         parse_mode="Markdown")
+
+async def cmd_dashboard(update,context):
+    """✅ v10.12 — Génère un dashboard HTML"""
+    if not auth(update): return
+    if not st.trades:
+        await update.message.reply_text("📊 Aucun trade pour générer le dashboard."); return
+    await update.message.reply_text("⏳ Génération dashboard...")
+    html=generate_dashboard(st.trades,st.bankroll,st.bankroll_ref,st.pnl)
+    filepath="/tmp/polybot_dashboard.html"
+    with open(filepath,"w",encoding="utf-8") as f: f.write(html)
+    with open(filepath,"rb") as f:
+        await context.bot.send_document(
+            chat_id=ALLOWED_UID,
+            document=f,
+            filename=f"polybot_dashboard_{datetime.now().strftime('%d%m_%H%M')}.html",
+            caption=f"📊 Dashboard v{BOT_VERSION} | BR:`{st.bankroll:.2f}$` | ROI:`{roi()}`"
+        )
 
 async def cmd_setbalance(update,context):
     if not auth(update): return
@@ -1089,7 +1262,7 @@ async def cmd_setbalance(update,context):
             f"✅ *Balance mise à jour*\n`{old:.2f}$` → `{new_bal:.2f}$`\nROI repart de `0%`",
             parse_mode="Markdown")
     except ValueError:
-        await update.message.reply_text("❌ Format invalide. Ex: `/setbalance 55.11`",parse_mode="Markdown")
+        await update.message.reply_text("❌ Ex: `/setbalance 55.11`",parse_mode="Markdown")
 
 async def cmd_backup(update,context):
     if not auth(update): return
@@ -1109,21 +1282,23 @@ async def cmd_status(update,context):
     if st.bet:
         elapsed=int((time.time()-st.bet["ts"])/60)
         bet_info=f"{st.bet['dir']} {st.bet['amount']:.2f}$ ({elapsed}min)"
-        if st.entry_token_price>0: bet_info+=f" peak:x{st.token_price_peak:.2f}"
-        if st.trailing_active: bet_info+=" 🎯TRAIL"
+        if st.trailing_active: bet_info+=f" 🎯peak:x{st.token_price_peak:.2f}"
+        if st.bet_expiry>0:
+            rem=int((st.bet_expiry-time.time())/60)
+            bet_info+=f" ⏰{rem}min"
     pause_info=""
     if st.daily_pause_until>time.time():
         remaining=int((st.daily_pause_until-time.time())/60)
         pause_info=f"\n⏸ Pause:`{remaining}min`"
     ob_txt=st.last_ob["desc"] if st.last_ob else "N/A"
-    liq_txt=st.last_liq["desc"] if st.last_liq and st.last_liq.get("bias") else "normal"
+    liq_txt=st.last_liq["desc"] if st.last_liq else "N/A"
     min_score,min_diff,min_mom=get_session_thresholds(sess["session"])
     await update.message.reply_text(
         f"📊 *STATUS v{BOT_VERSION}* [{'📄' if st.paper_mode else '💰'}]\n━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"{'🟢 EN COURS' if st.running else '🔴 ARRÊTÉ'} | {'✅ CLOB' if poly.ready else '❌ CLOB'}\n\n"
         f"₿`${st.price:,.2f}` | F&G:`{st.fg['value']}` | `{sess['session']}`\n"
         f"Seuils: score≥`{min_score}` mom≥`{min_mom}`\n"
-        f"📊 OB:`{ob_txt}` | 💥 Liq:`{liq_txt}`\n"
+        f"📊 `{ob_txt}` | 💸 `{liq_txt}`\n"
         f"🎯 {score_info}\n\n"
         f"💰 BR:`{st.bankroll:.2f}$` | ROI:`{roi()}` | PnL:`{fmt(st.pnl)}`\n"
         f"📅 Perte jour:`{dl:.1f}%/{DAILY_LOSS_MAX*100:.0f}%`{pause_info}\n"
@@ -1139,7 +1314,7 @@ async def cmd_balance(update,context):
         f"🔑 `{short}`\n"
         f"📊 BR:`{st.bankroll:.2f}$` | ROI:`{roi()}`\n"
         f"📈 PnL:`{fmt(st.pnl)}$` | Réf:`{st.bankroll_ref:.2f}$`\n\n"
-        f"💡 `/setbalance <montant>` pour sync + reset ROI",
+        f"💡 `/setbalance <montant>` pour sync",
         parse_mode="Markdown")
 
 async def cmd_market(update,context):
@@ -1150,11 +1325,14 @@ async def cmd_market(update,context):
     tu=await poly.get_token_price(market["token_up"]); td=await poly.get_token_price(market["token_down"])
     pu=round(1/tu,2) if tu>0 else 0; pd=round(1/td,2) if td>0 else 0
     ku=kelly_bet(st.bankroll,0.6,pu); kd=kelly_bet(st.bankroll,0.6,pd)
+    liq=st.last_liq; ob=st.last_ob
     await update.message.reply_text(
         f"🎯 *MARCHÉ ACTIF*\n━━━━━━━━━━━━━━━━━━━━━━━━\n_{market['question']}_\n\n"
         f"🟢 UP:`{tu:.3f}$`→x`{pu}` Kelly≈`{ku:.2f}$`\n"
         f"🔴 DOWN:`{td:.3f}$`→x`{pd}` Kelly≈`{kd:.2f}$`\n"
-        f"Fin:`{market.get('end_date','?')}`",parse_mode="Markdown")
+        f"Fin:`{market.get('end_date','?')}`\n\n"
+        f"📊 `{ob['desc'] if ob else 'N/A'}` | 💸 `{liq['desc'] if liq else 'N/A'}`",
+        parse_mode="Markdown")
 
 async def cmd_score(update,context):
     if not auth(update): return
@@ -1188,8 +1366,8 @@ async def cmd_score(update,context):
     await update.message.reply_text(
         f"🎯 *SCORE v{BOT_VERSION}*\n━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"₿`${st.price:,.2f}` | `{sess['session']}`{token_txt}\n"
-        f"Ξ ETH:`{eth_desc}` | 📊`{ob['desc'] if ob else 'N/A'}`\n"
-        f"💥`{liq['desc'] if liq else 'N/A'}`\n\n"
+        f"`{eth_desc}` | `{ob['desc'] if ob else 'N/A'}`\n"
+        f"💸 `{liq['desc'] if liq else 'N/A'}`\n\n"
         f"🟢 UP:`{cs['score_up']:.1f}` 🔴 DOWN:`{cs['score_dn']:.1f}`\n"
         f"Diff:`{cs['diff']:.1f}/{cs['min_diff']}` → {'✅ TRADEABLE' if cs['tradeable'] else '❌ PASS'}\n"
         f"⚡ Mom:`{mom}/10`(seuil:`{min_mom}`) {mom_e}\n\nSignaux:\n{sigs or '  Aucun'}",
@@ -1223,20 +1401,19 @@ async def cmd_signal(update,context):
     st.last_decision=d
     dir_e="🟢" if d["dir"]=="UP" else "🔴" if d["dir"]=="DOWN" else "⚪"
     risk_e={"LOW":"🟢","MEDIUM":"🟡","HIGH":"🔴"}.get(d.get("risk","MEDIUM"),"🟡")
-    payout=round
     payout=round(1/(tu if d["dir"]=="UP" else td),2) if d["dir"] else 0
     kelly_info=f" Kelly:`{d.get('kelly_pct',0):.1f}%`(`{d.get('size',0):.2f}$`)" if d.get("trade") else ""
     await update.message.reply_text(
         f"🧠 *ANALYSE v{BOT_VERSION}*\n━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"{dir_e} *{d['dir'] or 'PASS'}* | {risk_e} | `{d['conf']*100:.0f}%`\n"
         f"Score:`{cs['score']:.1f}` Mom:`{mom}/10` Payout:x`{payout}`{kelly_info}\n"
-        f"Ξ `{eth_desc}` | 📊`{ob['desc'] if ob else 'N/A'}`\n"
+        f"`{eth_desc}` | `{ob['desc'] if ob else 'N/A'}`\n"
         f"₿`${i5.get('price',0):,.2f}` | F&G:`{st.fg['value']}` | `{sess['session']}`\n\n"
         f"💭 _{d['reasoning']}_",parse_mode="Markdown")
 
 async def cmd_ai(update,context):
     if not auth(update): return
-    d=st.last_decision; cs=st.last_conf_score
+    d=st.last_decision
     if not d: await update.message.reply_text("⏳ Lance /signal d'abord."); return
     dir_e="🟢" if d.get("dir")=="UP" else "🔴" if d.get("dir")=="DOWN" else "⚪"
     risk_e={"LOW":"🟢","MEDIUM":"🟡","HIGH":"🔴"}.get(d.get("risk","MEDIUM"),"🟡")
@@ -1256,8 +1433,8 @@ async def cmd_trades(update,context):
         lines.append(f"{'✅' if t['result']=='WIN' else '❌'}{'💰' if not t.get('paper',True) else '📄'} `{t['dir']}` `{fmt(t['pnl'])}$` `{ts}`")
     if st.bet:
         elapsed=int((time.time()-st.bet["ts"])/60)
-        trail_info=" 🎯TRAIL" if st.trailing_active else ""
-        lines.append(f"\n🔄 *Actif:* `{st.bet['dir']}` `{st.bet['amount']:.2f}$` ({elapsed}min){trail_info}")
+        trail=" 🎯TRAIL" if st.trailing_active else ""
+        lines.append(f"\n🔄 *Actif:* `{st.bet['dir']}` `{st.bet['amount']:.2f}$` ({elapsed}min){trail}")
     await update.message.reply_text("\n".join(lines),parse_mode="Markdown")
 
 async def cmd_stats(update,context):
@@ -1268,12 +1445,23 @@ async def cmd_stats(update,context):
     rr=aw/al if al>0 else 0
     real_t=[t for t in st.trades if not t.get("paper",True)]
     real_wr=sum(1 for t in real_t if t["result"]=="WIN")/len(real_t)*100 if real_t else 0
+    # WR par session 7 jours
+    sess_7d=wr_by_session(st.trades,7)
+    sess_txt=""
+    for s,v in sorted(sess_7d.items(),key=lambda x:x[1]["w"]/(x[1]["w"]+x[1]["l"]) if (x[1]["w"]+x[1]["l"])>0 else 0,reverse=True):
+        tot=v["w"]+v["l"]
+        wr_s=round(v["w"]/tot*100) if tot>0 else 0
+        pnl_s=round(v["pnl"],2)
+        sess_txt+=f"\n  `{s}`: {wr_s}% ({v['w']}W/{v['l']}L) `{fmt(pnl_s)}$`"
     await update.message.reply_text(
         f"📉 *STATS v{BOT_VERSION}*\n━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"Total:`{total}` (✅{st.wins} ❌{st.losses})\nWR:`{wr()}` | ROI:`{roi()}` | R:R:`{rr:.2f}`\n"
         f"PnL:`{fmt(st.pnl)}$` | BR:`{st.bankroll:.2f}$`\n\n"
-        f"💰 Réels:`{len(real_t)}` WR:`{real_wr:.0f}%`\nGain moy:`+{aw:.2f}$` | Perte moy:`-{al:.2f}$`\n\n"
-        f"💡 `/recap` pour les stats 24h",parse_mode="Markdown")
+        f"💰 Réels:`{len(real_t)}` WR:`{real_wr:.0f}%`\n"
+        f"Gain moy:`+{aw:.2f}$` | Perte moy:`-{al:.2f}$`\n\n"
+        f"📊 WR par session (7j):{sess_txt or ' Pas assez de données'}\n\n"
+        f"💡 `/recap` 24h | `/dashboard` HTML",
+        parse_mode="Markdown")
 
 async def cmd_passes(update,context):
     if not auth(update): return
@@ -1303,7 +1491,7 @@ async def cmd_paper(update,context):
 async def cmd_reset(update,context):
     if not auth(update): return
     st.running=False
-    for j in [st.tick_job,st.price_job,st.macro_job,st.tp_job,st.backup_job]:
+    for j in [st.tick_job,st.price_job,st.macro_job,st.tp_job,st.backup_job,st.recap_job]:
         if j:
             try: j.schedule_removal()
             except: pass
@@ -1312,7 +1500,7 @@ async def cmd_reset(update,context):
     st.cooldown_until=0; st.daily_pause_until=0; st.session_start=time.time(); st.pass_reasons=[]
     st.last_conf_score={}; st.last_mom_score=0; st.active_order_id=None
     st.active_token_id=None; st.shares_bought=0; st.entry_token_price=0
-    st.token_price_peak=0; st.trailing_active=False
+    st.token_price_peak=0; st.trailing_active=False; st.bet_expiry=0
     st.c1.clear(); st.c5.clear(); st.c15.clear(); st.c1h.clear(); st.c4h.clear()
     for f in [DATA_FILE,BACKUP_FILE]:
         if os.path.exists(f): os.remove(f)
@@ -1338,7 +1526,7 @@ def main():
         ("ai",cmd_ai),("signal",cmd_signal),("score",cmd_score),("trades",cmd_trades),
         ("stats",cmd_stats),("fear",cmd_fear),("passes",cmd_passes),("market",cmd_market),
         ("balance",cmd_balance),("paper",cmd_paper),("cooldown",cmd_cooldown),("reset",cmd_reset),
-        ("setbalance",cmd_setbalance),("backup",cmd_backup),("recap",cmd_recap)]:
+        ("setbalance",cmd_setbalance),("backup",cmd_backup),("recap",cmd_recap),("dashboard",cmd_dashboard)]:
         app.add_handler(CommandHandler(name,handler))
     app.add_handler(CallbackQueryHandler(cb))
     log.info(f"🧠 PolyBot v{BOT_VERSION} démarré")
