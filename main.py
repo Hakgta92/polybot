@@ -15,7 +15,7 @@ from collections import deque
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 
-BOT_VERSION = "10.13d"
+BOT_VERSION = "10.13e"
 
 def load_env():
     env_path = os.path.join(os.path.dirname(__file__), '.env')
@@ -1130,7 +1130,15 @@ async def job_tick(context):
     st.last_conf_score=conf_score; st.last_mom_score=mom_score
     _,_,min_mom=get_session_thresholds(sess.get("session","OVERNIGHT"), conf_score.get("score",0))
     if not conf_score["tradeable"]:
-        st.skipped+=1; st.pass_reasons.append({"ts":int(time.time()),"reason":f"Score {conf_score['score']:.1f}<{conf_score['min_score']}"}); return
+        st.skipped+=1
+        # Message précis selon la vraie raison
+        if conf_score["score"] < conf_score["min_score"]:
+            reason = f"Score {conf_score['score']:.1f}<{conf_score['min_score']}"
+        elif conf_score["diff"] < conf_score["min_diff"]:
+            reason = f"Diff {conf_score['diff']:.1f}<{conf_score['min_diff']} (UP:{conf_score['score_up']:.1f} DN:{conf_score['score_dn']:.1f})"
+        else:
+            reason = f"Tradeable=NON score:{conf_score['score']:.1f} diff:{conf_score['diff']:.1f}"
+        st.pass_reasons.append({"ts":int(time.time()),"reason":reason}); return
     if mom_score<min_mom:
         st.skipped+=1; st.pass_reasons.append({"ts":int(time.time()),"reason":f"Mom {mom_score}<{min_mom}"}); return
     if i5.get("atr_pct",0)<0.03: st.skipped+=1; return
