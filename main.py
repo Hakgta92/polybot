@@ -15,7 +15,7 @@ from collections import deque
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 
-BOT_VERSION = "10.14e"
+BOT_VERSION = "10.14f"
 
 def load_env():
     env_path = os.path.join(os.path.dirname(__file__), '.env')
@@ -926,7 +926,7 @@ Signaux:{sigs_txt}
 {patterns} | {loss_analysis}
 {trades_txt}Consec:{consec} | BR:{bankroll:.2f}$
 RÈGLES STRICTES:
-✅ TRADER si: tradeable=OUI ET mom≥{min_mom} ET payout≥1.5
+✅ TRADER si: tradeable=OUI ET mom≥{min_mom} ET payout≥1.3
 ❌ PASSER si: tradeable=NON OU mom<{min_mom} OU payout<1.5
 ⚠️ mom={min_mom} exactement = VALIDE, ne pas refuser pour "manque de marge"
 ⚠️ Ne jamais inventer des raisons supplémentaires pour passer si les 3 conditions ✅ sont remplies
