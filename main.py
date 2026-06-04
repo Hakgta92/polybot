@@ -15,7 +15,7 @@ from collections import deque
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 
-BOT_VERSION = "10.12f"
+BOT_VERSION = "10.13"
 
 def load_env():
     env_path = os.path.join(os.path.dirname(__file__), '.env')
@@ -1059,6 +1059,22 @@ async def job_macro(context):
 
 async def job_tick(context):
     if not st.running: return
+
+    # ✅ v10.13 — Synchronisation sur les slots de marché BTC 5min
+    # Les slots expirent à :00, :05, :10... (multiples de 5min)
+    # On trade seulement dans les 3 premières minutes du slot
+    now_ts = time.time()
+    slot_pos = now_ts % 300  # Position dans le slot actuel (0-299 secondes)
+    slot_remaining = 300 - slot_pos  # Temps restant dans ce slot
+
+    # Skip si on est trop loin dans le slot (< 90s restantes = trop tard pour placer)
+    if slot_remaining < 90:
+        return
+
+    # Skip si on est en tout début de slot (< 15s = marché pas encore ouvert)
+    if slot_pos < 15:
+        return
+
     paused=check_daily()
     if paused:
         remaining=int((st.daily_pause_until-time.time())/60)
@@ -1208,11 +1224,10 @@ async def cmd_run(update,context):
     st.running=True; st.session_start=time.time(); st.daily_ts=time.time()
     st.price_job=context.job_queue.run_repeating(job_price,interval=30,first=5)
     st.macro_job=context.job_queue.run_repeating(job_macro,interval=300,first=8)
-    st.tick_job=context.job_queue.run_repeating(job_tick,interval=300,first=15)
+    st.tick_job=context.job_queue.run_repeating(job_tick,interval=60,first=10)   # ✅ v10.13: 1min
     st.tp_job=context.job_queue.run_repeating(job_take_profit,interval=TAKE_PROFIT_CHECK,first=10)
     st.backup_job=context.job_queue.run_repeating(job_backup,interval=600,first=60)
     st.recap_job=context.job_queue.run_repeating(job_daily_recap,interval=3600,first=60)
-    # Alerte expiration toutes les 30s
     context.job_queue.run_repeating(job_check_expiry,interval=30,first=15)
     st.fg=await fetch_fear_greed(); st.btc24=await fetch_btc_24h(); sess=session_ctx()
     st.last_ob=await fetch_orderbook_imbalance()
