@@ -15,7 +15,7 @@ from collections import deque
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 
-BOT_VERSION = "10.12"
+BOT_VERSION = "10.12b"
 
 def load_env():
     env_path = os.path.join(os.path.dirname(__file__), '.env')
@@ -85,50 +85,82 @@ def kelly_bet(bankroll, win_prob, payout_mult):
 # ─── DONNÉES AVANCÉES ──────────────────────────────────────────────────────
 async def fetch_orderbook_imbalance():
     """
-    ✅ v10.12 — Binance SPOT /depth (passe sur Railway, pas de restriction).
-    ratio > 0.62 = pression achat → biais UP
-    ratio < 0.38 = pression vente → biais DOWN
+    ✅ v10.12 fix — Binance spot + Bybit fallback pour OB.
+    Retourne toujours un résultat avec ratio visible.
     """
+    headers = {"User-Agent": "Mozilla/5.0", "Accept": "application/json"}
+    
+    # Essai 1: Binance spot
+    for url, params in [
+        ("https://api.binance.com/api/v3/depth", {"symbol": "BTCUSDT", "limit": 20}),
+        ("https://api.binance.com/api/v3/ticker/bookTicker", {"symbol": "BTCUSDT"}),
+    ]:
+        try:
+            async with aiohttp.ClientSession(headers=headers) as s:
+                async with s.get(url, params=params, timeout=aiohttp.ClientTimeout(total=6)) as r:
+                    log.info(f"OB {url}: status={r.status}")
+                    if r.status == 200:
+                        data = await r.json()
+                        if "bids" in data:
+                            bids = sum(float(b[1]) for b in data.get("bids", []))
+                            asks = sum(float(a[1]) for a in data.get("asks", []))
+                            total = bids + asks
+                            if total > 0:
+                                ratio = round(bids / total, 3)
+                                if ratio > 0.62:
+                                    return {"bias": "UP", "ratio": ratio, "desc": f"📗 OB {ratio*100:.0f}% buy"}
+                                elif ratio < 0.38:
+                                    return {"bias": "DOWN", "ratio": ratio, "desc": f"📕 OB {(1-ratio)*100:.0f}% sell"}
+                                else:
+                                    return {"bias": None, "ratio": ratio, "desc": f"OB neutre {ratio*100:.0f}%"}
+        except Exception as e:
+            log.warning(f"OB {url}: {e}")
+
+    # Essai 2: Bybit
     try:
-        async with aiohttp.ClientSession() as s:
+        async with aiohttp.ClientSession(headers=headers) as s:
             async with s.get(
-                "https://api.binance.com/api/v3/depth",
-                params={"symbol": "BTCUSDT", "limit": 20},
+                "https://api.bybit.com/v5/market/orderbook",
+                params={"category": "linear", "symbol": "BTCUSDT", "limit": 10},
                 timeout=aiohttp.ClientTimeout(total=6)
             ) as r:
+                log.info(f"OB Bybit: status={r.status}")
                 if r.status == 200:
                     data = await r.json()
-                    bids = sum(float(b[1]) for b in data.get("bids", []))
-                    asks = sum(float(a[1]) for a in data.get("asks", []))
+                    result = data.get("result", {})
+                    bids = sum(float(b[1]) for b in result.get("b", []))
+                    asks = sum(float(a[1]) for a in result.get("a", []))
                     total = bids + asks
                     if total > 0:
                         ratio = round(bids / total, 3)
                         if ratio > 0.62:
-                            return {"bias": "UP", "ratio": ratio, "desc": f"📗 OB achat {ratio*100:.0f}%"}
+                            return {"bias": "UP", "ratio": ratio, "desc": f"📗 OB {ratio*100:.0f}% buy"}
                         elif ratio < 0.38:
-                            return {"bias": "DOWN", "ratio": ratio, "desc": f"📕 OB vente {(1-ratio)*100:.0f}%"}
+                            return {"bias": "DOWN", "ratio": ratio, "desc": f"📕 OB {(1-ratio)*100:.0f}% sell"}
                         else:
                             return {"bias": None, "ratio": ratio, "desc": f"OB neutre {ratio*100:.0f}%"}
     except Exception as e:
-        log.warning(f"OB spot: {e}")
+        log.warning(f"OB Bybit: {e}")
+
     return {"bias": None, "ratio": 0.5, "desc": "OB N/A"}
 
 async def fetch_liquidations():
     """
-    ✅ v10.12 — Funding rate + Open Interest via Binance Futures (accessible Railway).
-    Funding rate élevé positif = trop de longs = risque baisse
-    Funding rate négatif = trop de shorts = risque hausse
-    OI qui monte avec prix = tendance saine
+    ✅ v10.12 fix — Binance futures + Bybit funding fallback.
+    Logs détaillés pour diagnostiquer Railway.
     """
+    headers = {"User-Agent": "Mozilla/5.0", "Accept": "application/json"}
     result = {"bias": None, "desc": "Liq N/A"}
+
+    # Essai 1: Binance futures funding
     try:
-        async with aiohttp.ClientSession() as s:
-            # Funding rate
+        async with aiohttp.ClientSession(headers=headers) as s:
             async with s.get(
                 "https://fapi.binance.com/fapi/v1/fundingRate",
                 params={"symbol": "BTCUSDT", "limit": 1},
-                timeout=aiohttp.ClientTimeout(total=6)
+                timeout=aiohttp.ClientTimeout(total=8)
             ) as r:
+                log.info(f"Funding Binance: status={r.status}")
                 if r.status == 200:
                     data = await r.json()
                     if data:
@@ -142,40 +174,83 @@ async def fetch_liquidations():
                             result = {"bias": bias, "fr": fr, "desc": f"Funding {fr:+.3f}%"}
                         else:
                             result = {"bias": None, "fr": fr, "desc": f"Funding {fr:+.3f}% (neutre)"}
+                        # OI
+                        try:
+                            async with s.get("https://fapi.binance.com/fapi/v1/openInterest",
+                                             params={"symbol": "BTCUSDT"},
+                                             timeout=aiohttp.ClientTimeout(total=5)) as r2:
+                                if r2.status == 200:
+                                    d2 = await r2.json()
+                                    oi = float(d2.get("openInterest", 0))
+                                    result["desc"] += f" OI:{oi/1000:.0f}K"
+                        except: pass
+                        return result
     except Exception as e:
-        log.warning(f"Funding rate: {e}")
+        log.warning(f"Funding Binance: {e}")
 
-    # Open Interest en bonus
+    # Essai 2: Bybit funding rate
     try:
-        async with aiohttp.ClientSession() as s:
+        async with aiohttp.ClientSession(headers=headers) as s:
             async with s.get(
-                "https://fapi.binance.com/fapi/v1/openInterest",
-                params={"symbol": "BTCUSDT"},
-                timeout=aiohttp.ClientTimeout(total=6)
+                "https://api.bybit.com/v5/market/tickers",
+                params={"category": "linear", "symbol": "BTCUSDT"},
+                timeout=aiohttp.ClientTimeout(total=8)
             ) as r:
+                log.info(f"Funding Bybit: status={r.status}")
                 if r.status == 200:
                     data = await r.json()
-                    oi = float(data.get("openInterest", 0))
-                    result["oi"] = round(oi, 0)
-                    result["desc"] += f" | OI:{oi/1000:.1f}K"
+                    items = data.get("result", {}).get("list", [])
+                    if items:
+                        fr = float(items[0].get("fundingRate", 0)) * 100
+                        oi = float(items[0].get("openInterest", 0))
+                        if fr > 0.08:
+                            return {"bias": "DOWN", "fr": fr, "desc": f"💸 Bybit Funding +{fr:.3f}% OI:{oi/1e6:.1f}M"}
+                        elif fr < -0.08:
+                            return {"bias": "UP", "fr": fr, "desc": f"💸 Bybit Funding {fr:.3f}% OI:{oi/1e6:.1f}M"}
+                        else:
+                            return {"bias": None, "fr": fr, "desc": f"Bybit FR {fr:+.3f}% OI:{oi/1e6:.1f}M"}
     except Exception as e:
-        log.warning(f"OI: {e}")
+        log.warning(f"Funding Bybit: {e}")
 
     return result
 
 async def fetch_eth_klines(interval="5m", limit=30):
+    """✅ v10.12 fix — Binance + Kraken fallback pour ETH klines"""
+    headers = {"User-Agent": "Mozilla/5.0", "Accept": "application/json"}
+    # Binance
     try:
-        async with aiohttp.ClientSession() as s:
+        async with aiohttp.ClientSession(headers=headers) as s:
             async with s.get(
-                f"https://api.binance.com/api/v3/klines?symbol=ETHUSDT&interval={interval}&limit={limit}",
+                f"https://api.binance.com/api/v3/klines",
+                params={"symbol": "ETHUSDT", "interval": interval, "limit": limit},
                 timeout=aiohttp.ClientTimeout(total=8)
             ) as r:
+                log.info(f"ETH klines Binance: status={r.status}")
                 if r.status == 200:
                     data = await r.json()
                     if isinstance(data, list) and len(data) > 5:
                         return [{"close": float(k[4]), "open": float(k[1]),
                                  "high": float(k[2]), "low": float(k[3]), "vol": float(k[5])} for k in data]
-    except: pass
+    except Exception as e:
+        log.warning(f"ETH klines Binance: {e}")
+    # Kraken fallback
+    km = {"1m": 1, "5m": 5, "15m": 15, "1h": 60}
+    try:
+        async with aiohttp.ClientSession(headers=headers) as s:
+            async with s.get(
+                "https://api.kraken.com/0/public/OHLC",
+                params={"pair": "ETHUSD", "interval": km.get(interval, 5), "count": limit},
+                timeout=aiohttp.ClientTimeout(total=8)
+            ) as r:
+                log.info(f"ETH klines Kraken: status={r.status}")
+                if r.status == 200:
+                    data = await r.json()
+                    ohlc = data.get("result", {}).get("XETHUSD", data.get("result", {}).get("ETHUSD", []))
+                    if ohlc:
+                        return [{"close": float(k[4]), "open": float(k[1]),
+                                 "high": float(k[2]), "low": float(k[3]), "vol": float(k[6])} for k in ohlc[-limit:]]
+    except Exception as e:
+        log.warning(f"ETH klines Kraken: {e}")
     return []
 
 def compute_eth_correlation(eth_klines, btc_direction):
