@@ -15,7 +15,7 @@ from collections import deque
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 
-BOT_VERSION = "10.12b"
+BOT_VERSION = "10.12c"
 
 def load_env():
     env_path = os.path.join(os.path.dirname(__file__), '.env')
@@ -85,156 +85,96 @@ def kelly_bet(bankroll, win_prob, payout_mult):
 # ─── DONNÉES AVANCÉES ──────────────────────────────────────────────────────
 async def fetch_orderbook_imbalance():
     """
-    ✅ v10.12 fix — Binance spot + Bybit fallback pour OB.
-    Retourne toujours un résultat avec ratio visible.
+    ✅ v10.12c — Kraken spread + ticker comme proxy OB.
+    Kraken status=200 confirmé sur Railway US West.
+    bid/ask ratio et momentum prix = biais directionnel.
     """
     headers = {"User-Agent": "Mozilla/5.0", "Accept": "application/json"}
-    
-    # Essai 1: Binance spot
-    for url, params in [
-        ("https://api.binance.com/api/v3/depth", {"symbol": "BTCUSDT", "limit": 20}),
-        ("https://api.binance.com/api/v3/ticker/bookTicker", {"symbol": "BTCUSDT"}),
-    ]:
-        try:
-            async with aiohttp.ClientSession(headers=headers) as s:
-                async with s.get(url, params=params, timeout=aiohttp.ClientTimeout(total=6)) as r:
-                    log.info(f"OB {url}: status={r.status}")
-                    if r.status == 200:
-                        data = await r.json()
-                        if "bids" in data:
-                            bids = sum(float(b[1]) for b in data.get("bids", []))
-                            asks = sum(float(a[1]) for a in data.get("asks", []))
-                            total = bids + asks
-                            if total > 0:
-                                ratio = round(bids / total, 3)
-                                if ratio > 0.62:
-                                    return {"bias": "UP", "ratio": ratio, "desc": f"📗 OB {ratio*100:.0f}% buy"}
-                                elif ratio < 0.38:
-                                    return {"bias": "DOWN", "ratio": ratio, "desc": f"📕 OB {(1-ratio)*100:.0f}% sell"}
-                                else:
-                                    return {"bias": None, "ratio": ratio, "desc": f"OB neutre {ratio*100:.0f}%"}
-        except Exception as e:
-            log.warning(f"OB {url}: {e}")
-
-    # Essai 2: Bybit
     try:
         async with aiohttp.ClientSession(headers=headers) as s:
             async with s.get(
-                "https://api.bybit.com/v5/market/orderbook",
-                params={"category": "linear", "symbol": "BTCUSDT", "limit": 10},
+                "https://api.kraken.com/0/public/Ticker",
+                params={"pair": "XBTUSD"},
                 timeout=aiohttp.ClientTimeout(total=6)
             ) as r:
-                log.info(f"OB Bybit: status={r.status}")
                 if r.status == 200:
                     data = await r.json()
-                    result = data.get("result", {})
-                    bids = sum(float(b[1]) for b in result.get("b", []))
-                    asks = sum(float(a[1]) for a in result.get("a", []))
-                    total = bids + asks
-                    if total > 0:
-                        ratio = round(bids / total, 3)
-                        if ratio > 0.62:
-                            return {"bias": "UP", "ratio": ratio, "desc": f"📗 OB {ratio*100:.0f}% buy"}
-                        elif ratio < 0.38:
-                            return {"bias": "DOWN", "ratio": ratio, "desc": f"📕 OB {(1-ratio)*100:.0f}% sell"}
+                    t = data.get("result", {}).get("XXBTZUSD", {})
+                    if t:
+                        bid = float(t["b"][0])   # meilleur bid
+                        ask = float(t["a"][0])   # meilleur ask
+                        bid_vol = float(t["b"][2])  # volume bid
+                        ask_vol = float(t["a"][2])  # volume ask
+                        spread_pct = (ask - bid) / bid * 100
+                        # Volume 24h buy vs sell (trades)
+                        vol_24h = float(t["v"][1])
+                        vwap_24h = float(t["p"][1])
+                        price = float(t["c"][0])
+                        # Si prix > VWAP 24h → pression achat
+                        total_vol = bid_vol + ask_vol if (bid_vol + ask_vol) > 0 else 1
+                        ratio = round(bid_vol / total_vol, 3)
+                        above_vwap = price > vwap_24h
+                        if above_vwap and ratio > 0.5:
+                            return {"bias": "UP", "ratio": ratio, "desc": f"📗 Kraken OB↑ spread:{spread_pct:.3f}%"}
+                        elif not above_vwap and ratio < 0.5:
+                            return {"bias": "DOWN", "ratio": ratio, "desc": f"📕 Kraken OB↓ spread:{spread_pct:.3f}%"}
                         else:
-                            return {"bias": None, "ratio": ratio, "desc": f"OB neutre {ratio*100:.0f}%"}
+                            return {"bias": None, "ratio": ratio, "desc": f"Kraken OB neutre spread:{spread_pct:.3f}%"}
     except Exception as e:
-        log.warning(f"OB Bybit: {e}")
-
+        log.warning(f"OB Kraken: {e}")
     return {"bias": None, "ratio": 0.5, "desc": "OB N/A"}
 
 async def fetch_liquidations():
     """
-    ✅ v10.12 fix — Binance futures + Bybit funding fallback.
-    Logs détaillés pour diagnostiquer Railway.
+    ✅ v10.12c — Kraken futures OI + momentum comme proxy liquidations.
+    Binance/Bybit bloqués (451/403) sur Railway US West.
+    On utilise Kraken 24h stats pour détecter excès directionnel.
     """
     headers = {"User-Agent": "Mozilla/5.0", "Accept": "application/json"}
-    result = {"bias": None, "desc": "Liq N/A"}
-
-    # Essai 1: Binance futures funding
     try:
         async with aiohttp.ClientSession(headers=headers) as s:
             async with s.get(
-                "https://fapi.binance.com/fapi/v1/fundingRate",
-                params={"symbol": "BTCUSDT", "limit": 1},
-                timeout=aiohttp.ClientTimeout(total=8)
+                "https://api.kraken.com/0/public/Ticker",
+                params={"pair": "XBTUSD"},
+                timeout=aiohttp.ClientTimeout(total=6)
             ) as r:
-                log.info(f"Funding Binance: status={r.status}")
                 if r.status == 200:
                     data = await r.json()
-                    if data:
-                        fr = float(data[0].get("fundingRate", 0)) * 100
-                        if fr > 0.08:
-                            result = {"bias": "DOWN", "fr": fr, "desc": f"💸 Funding +{fr:.3f}% (longs surexposés)"}
-                        elif fr < -0.08:
-                            result = {"bias": "UP", "fr": fr, "desc": f"💸 Funding {fr:.3f}% (shorts surexposés)"}
-                        elif abs(fr) > 0.03:
-                            bias = "DOWN" if fr > 0 else "UP"
-                            result = {"bias": bias, "fr": fr, "desc": f"Funding {fr:+.3f}%"}
+                    t = data.get("result", {}).get("XXBTZUSD", {})
+                    if t:
+                        price = float(t["c"][0])
+                        high_24h = float(t["h"][1])
+                        low_24h = float(t["l"][1])
+                        vwap_24h = float(t["p"][1])
+                        trades_24h = int(t["t"][1])
+                        vol_24h = float(t["v"][1])
+                        open_price = float(t["o"])
+                        change_pct = (price - open_price) / open_price * 100 if open_price > 0 else 0
+                        range_pct = (high_24h - low_24h) / low_24h * 100 if low_24h > 0 else 0
+                        # Position dans le range 24h
+                        if (high_24h - low_24h) > 0:
+                            pos_in_range = (price - low_24h) / (high_24h - low_24h)
                         else:
-                            result = {"bias": None, "fr": fr, "desc": f"Funding {fr:+.3f}% (neutre)"}
-                        # OI
-                        try:
-                            async with s.get("https://fapi.binance.com/fapi/v1/openInterest",
-                                             params={"symbol": "BTCUSDT"},
-                                             timeout=aiohttp.ClientTimeout(total=5)) as r2:
-                                if r2.status == 200:
-                                    d2 = await r2.json()
-                                    oi = float(d2.get("openInterest", 0))
-                                    result["desc"] += f" OI:{oi/1000:.0f}K"
-                        except: pass
-                        return result
-    except Exception as e:
-        log.warning(f"Funding Binance: {e}")
-
-    # Essai 2: Bybit funding rate
-    try:
-        async with aiohttp.ClientSession(headers=headers) as s:
-            async with s.get(
-                "https://api.bybit.com/v5/market/tickers",
-                params={"category": "linear", "symbol": "BTCUSDT"},
-                timeout=aiohttp.ClientTimeout(total=8)
-            ) as r:
-                log.info(f"Funding Bybit: status={r.status}")
-                if r.status == 200:
-                    data = await r.json()
-                    items = data.get("result", {}).get("list", [])
-                    if items:
-                        fr = float(items[0].get("fundingRate", 0)) * 100
-                        oi = float(items[0].get("openInterest", 0))
-                        if fr > 0.08:
-                            return {"bias": "DOWN", "fr": fr, "desc": f"💸 Bybit Funding +{fr:.3f}% OI:{oi/1e6:.1f}M"}
-                        elif fr < -0.08:
-                            return {"bias": "UP", "fr": fr, "desc": f"💸 Bybit Funding {fr:.3f}% OI:{oi/1e6:.1f}M"}
+                            pos_in_range = 0.5
+                        # Détection excès: si prix très haut du range ET forte hausse = risque retournement
+                        if pos_in_range > 0.85 and change_pct > 2.0:
+                            return {"bias": "DOWN", "desc": f"💸 Suracheté {pos_in_range*100:.0f}% range +{change_pct:.1f}%"}
+                        elif pos_in_range < 0.15 and change_pct < -2.0:
+                            return {"bias": "UP", "desc": f"💸 Survendu {pos_in_range*100:.0f}% range {change_pct:.1f}%"}
                         else:
-                            return {"bias": None, "fr": fr, "desc": f"Bybit FR {fr:+.3f}% OI:{oi/1e6:.1f}M"}
+                            bias = None
+                            if change_pct > 1.0: bias = "DOWN"
+                            elif change_pct < -1.0: bias = "UP"
+                            return {"bias": bias, "desc": f"Kraken {change_pct:+.2f}% pos:{pos_in_range*100:.0f}%range"}
     except Exception as e:
-        log.warning(f"Funding Bybit: {e}")
+        log.warning(f"Liq Kraken: {e}")
+    return {"bias": None, "desc": "Liq N/A"}
 
-    return result
 
 async def fetch_eth_klines(interval="5m", limit=30):
-    """✅ v10.12 fix — Binance + Kraken fallback pour ETH klines"""
+    """✅ v10.12c — Kraken directement (Binance bloqué 451 sur Railway US West)"""
     headers = {"User-Agent": "Mozilla/5.0", "Accept": "application/json"}
-    # Binance
-    try:
-        async with aiohttp.ClientSession(headers=headers) as s:
-            async with s.get(
-                f"https://api.binance.com/api/v3/klines",
-                params={"symbol": "ETHUSDT", "interval": interval, "limit": limit},
-                timeout=aiohttp.ClientTimeout(total=8)
-            ) as r:
-                log.info(f"ETH klines Binance: status={r.status}")
-                if r.status == 200:
-                    data = await r.json()
-                    if isinstance(data, list) and len(data) > 5:
-                        return [{"close": float(k[4]), "open": float(k[1]),
-                                 "high": float(k[2]), "low": float(k[3]), "vol": float(k[5])} for k in data]
-    except Exception as e:
-        log.warning(f"ETH klines Binance: {e}")
-    # Kraken fallback
-    km = {"1m": 1, "5m": 5, "15m": 15, "1h": 60}
+    km = {"1m": 1, "5m": 5, "15m": 15, "1h": 60, "4h": 240}
     try:
         async with aiohttp.ClientSession(headers=headers) as s:
             async with s.get(
@@ -242,10 +182,10 @@ async def fetch_eth_klines(interval="5m", limit=30):
                 params={"pair": "ETHUSD", "interval": km.get(interval, 5), "count": limit},
                 timeout=aiohttp.ClientTimeout(total=8)
             ) as r:
-                log.info(f"ETH klines Kraken: status={r.status}")
                 if r.status == 200:
                     data = await r.json()
-                    ohlc = data.get("result", {}).get("XETHUSD", data.get("result", {}).get("ETHUSD", []))
+                    ohlc = data.get("result", {}).get("XETHUSD",
+                           data.get("result", {}).get("ETHUSD", []))
                     if ohlc:
                         return [{"close": float(k[4]), "open": float(k[1]),
                                  "high": float(k[2]), "low": float(k[3]), "vol": float(k[6])} for k in ohlc[-limit:]]
