@@ -15,7 +15,7 @@ from collections import deque
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 
-BOT_VERSION = "10.14g"
+BOT_VERSION = "10.14h"
 
 def load_env():
     env_path = os.path.join(os.path.dirname(__file__), '.env')
@@ -925,11 +925,13 @@ Signaux:{sigs_txt}
 15m RSI:{i15.get('rsi_14',50)} EMA:{'↑' if i15.get('ema_bull') else '↓'} | 1h:{'↑' if i1h.get('ema_bull') else '↓'} | {i4h_txt}
 {patterns} | {loss_analysis}
 {trades_txt}Consec:{consec} | BR:{bankroll:.2f}$
-RÈGLES STRICTES:
-✅ TRADER si: tradeable=OUI ET mom≥{min_mom} ET payout≥1.3
-❌ PASSER si: tradeable=NON OU mom<{min_mom} OU payout<1.3
-⚠️ mom={min_mom} exactement = VALIDE, ne pas refuser pour "manque de marge"
-⚠️ Ne jamais inventer des raisons supplémentaires pour passer si les 3 conditions ✅ sont remplies
+RÈGLES STRICTES ET NON NÉGOCIABLES:
+✅ TRADER OBLIGATOIREMENT si: tradeable=OUI ET mom≥{min_mom} ET payout≥1.3
+❌ PASSER UNIQUEMENT si: tradeable=NON OU mom<{min_mom} OU payout<1.3
+🚫 INTERDIT de refuser pour: RSI suracheté/survendu, divergences, corrections potentielles, risques techniques
+🚫 INTERDIT d'inventer des raisons supplémentaires
+⚠️ mom={min_mom} exactement = VALIDE sans exception
+⚠️ Si les 3 conditions ✅ sont remplies → trade=true OBLIGATOIRE
 JSON:{{"trade":true/false,"direction":"UP"/"DOWN"/null,"confidence":0.0-1.0,"bet_size":{MIN_BET_USD}-{MAX_BET_USD},"reasoning":"2 phrases FR","risk_level":"LOW"/"MEDIUM"/"HIGH"}}"""
     try:
         async with aiohttp.ClientSession() as s:
