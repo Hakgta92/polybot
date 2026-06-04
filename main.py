@@ -15,7 +15,7 @@ from collections import deque
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 
-BOT_VERSION = "10.12e"
+BOT_VERSION = "10.12f"
 
 def load_env():
     env_path = os.path.join(os.path.dirname(__file__), '.env')
@@ -64,6 +64,11 @@ SESSION_THRESHOLDS = {
     "ASIA_EARLY":   (11, 4.0, 5),
     "OVERNIGHT":    (12, 4.5, 6),
 }
+
+# ✅ v10.12f — Seuil momentum réduit si score très élevé
+# Score ≥ 13 → momentum minimum réduit de 1 point (tous les signaux très alignés)
+# Score ≥ 15 → momentum minimum réduit de 2 points (confluence exceptionnelle)
+SCORE_MOMENTUM_BONUS = {13: 1, 15: 2}
 
 CLAUDE_API    = "https://api.anthropic.com/v1/messages"
 FEAR_GREED_API= "https://api.alternative.me/fng/?limit=1"
@@ -588,8 +593,19 @@ def session_ctx():
     elif  1<=h< 7: return {"session":"ASIA_EARLY",  "quality":"MEDIUM",   "score_bonus":-1}
     else:          return {"session":"OVERNIGHT",   "quality":"LOW",      "score_bonus":-2}
 
-def get_session_thresholds(session_name):
-    return SESSION_THRESHOLDS.get(session_name,(10,3.5,4))
+def get_session_thresholds(session_name, score=0):
+    """
+    ✅ v10.12f — Seuil momentum adaptatif selon le score.
+    Score ≥ 13 → min_mom -1 (signaux très alignés)
+    Score ≥ 15 → min_mom -2 (confluence exceptionnelle)
+    """
+    min_score, min_diff, min_mom = SESSION_THRESHOLDS.get(session_name, (10, 3.5, 4))
+    # Réduit le seuil momentum si score très élevé
+    if score >= 15:
+        min_mom = max(2, min_mom - 2)
+    elif score >= 13:
+        min_mom = max(2, min_mom - 1)
+    return min_score, min_diff, min_mom
 
 def compute_confluence_score(i1,i5,i15,i1h,i4h,fg,sess,adv,ob=None,liq=None,eth_bonus=0,eth_desc=""):
     up=0.0; dn=0.0; signals=[]
@@ -671,7 +687,10 @@ def compute_confluence_score(i1,i5,i15,i1h,i4h,fg,sess,adv,ob=None,liq=None,eth_
         if eth_desc: signals.append(eth_desc)
     direction="UP" if up>=dn else "DOWN"
     score=round(up if up>=dn else dn,1); diff=round(abs(up-dn),1)
-    min_score,min_diff,min_mom=get_session_thresholds(sess.get("session","OVERNIGHT"))
+    # ✅ Score provisoire pour adapter le seuil momentum
+    direction_tmp="UP" if up>=dn else "DOWN"
+    score_tmp=round(up if up>=dn else dn,1)
+    min_score,min_diff,min_mom=get_session_thresholds(sess.get("session","OVERNIGHT"), score_tmp)
     return {"score_up":round(up,1),"score_dn":round(dn,1),"score":score,"diff":diff,
             "direction":direction,"signals":signals[:10],"min_score":min_score,
             "min_diff":min_diff,"min_mom":min_mom,
@@ -1088,7 +1107,7 @@ async def job_tick(context):
     conf_score=compute_confluence_score(i1,i5,i15,i1h,i4h,st.fg,sess,adv,st.last_ob,st.last_liq,eth_bonus,eth_desc)
     mom_score=compute_momentum_score(i1,i5,i15)
     st.last_conf_score=conf_score; st.last_mom_score=mom_score
-    _,_,min_mom=get_session_thresholds(sess.get("session","OVERNIGHT"))
+    _,_,min_mom=get_session_thresholds(sess.get("session","OVERNIGHT"), conf_score.get("score",0))
     if not conf_score["tradeable"]:
         st.skipped+=1; st.pass_reasons.append({"ts":int(time.time()),"reason":f"Score {conf_score['score']:.1f}<{conf_score['min_score']}"}); return
     if mom_score<min_mom:
@@ -1386,7 +1405,7 @@ async def cmd_score(update,context):
     mom=compute_momentum_score(i1,i5,i15)
     st.last_conf_score=cs; st.last_mom_score=mom; st.last_ob=ob; st.last_liq=liq
     st.last_eth_klines=eth_klines  # ✅ Cache
-    _,_,min_mom=get_session_thresholds(sess["session"])
+    _,_,min_mom=get_session_thresholds(sess["session"], cs.get("score",0) if "cs" in dir() else 0)
     token_txt=""
     if not st.paper_mode and poly.ready:
         m=await poly.find_btc_5min_market()
