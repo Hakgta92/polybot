@@ -15,7 +15,7 @@ from collections import deque
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 
-BOT_VERSION = "10.13b"
+BOT_VERSION = "10.13c"
 
 def load_env():
     env_path = os.path.join(os.path.dirname(__file__), '.env')
@@ -1071,8 +1071,9 @@ async def job_tick(context):
     slot_pos = now_ts % 300  # Position dans le slot actuel (0-299 secondes)
     slot_remaining = 300 - slot_pos  # Temps restant dans ce slot
 
-    # Skip si on est trop loin dans le slot (< 90s restantes = trop tard pour placer)
-    if slot_remaining < 90:
+    # Skip si on est trop loin dans le slot (< 120s restantes = trop tard pour placer)
+    # La séquence analyse+Claude+ordre prend ~10-15s, 120s de marge = sécurité
+    if slot_remaining < 120:
         return
 
     # Skip si on est en tout début de slot (< 15s = marché pas encore ouvert)
@@ -1163,9 +1164,15 @@ async def job_tick(context):
         if not st.paper_mode and st.current_market:
             token_used=st.current_market["token_up"] if dec["dir"]=="UP" else st.current_market["token_down"]
             entry_tp=tpu if dec["dir"]=="UP" else tpd
+            # ✅ v10.13c — Vérification finale expiration avant d'envoyer l'ordre
+            if market_end > 0 and (market_end - time.time()) < 60:
+                log.warning(f"Ordre annulé — slot expire dans {market_end-time.time():.0f}s")
+                st.skipped+=1
+                st.pass_reasons.append({"ts":int(time.time()),"reason":"Slot expiré avant ordre"})
+                return
             order_id=await poly.place_market_order(token_used,amount,"BUY")
             if not order_id:
-                await send(context.bot,"⚠️ *Ordre Polymarket refusé*"); return
+                await send(context.bot,"⚠️ *Ordre Polymarket refusé — réessai prochain slot*"); return
             st.active_order_id=order_id; st.active_token_id=token_used
             st.entry_token_price=entry_tp; st.shares_bought=round(amount/entry_tp,4) if entry_tp>0 else 0
             st.token_price_peak=1.0; st.trailing_active=False
