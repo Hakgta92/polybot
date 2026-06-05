@@ -15,7 +15,7 @@ from collections import deque
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 
-BOT_VERSION = "10.16"
+BOT_VERSION = "10.16b"
 
 def load_env():
     env_path = os.path.join(os.path.dirname(__file__), '.env')
@@ -715,7 +715,7 @@ def get_session_thresholds(session_name, score=0):
         min_mom = max(2, min_mom - 1)
     return min_score, min_diff, min_mom
 
-def compute_confluence_score(i1,i5,i15,i1h,i4h,fg,sess,adv,ob=None,liq=None,eth_bonus=0,eth_desc=""):
+def compute_confluence_score(i1,i5,i15,i1h,i4h,fg,sess,adv,ob=None,liq=None,eth_bonus=0,eth_desc="",btc24=None):
     up=0.0; dn=0.0; signals=[]
     if i4h:
         if i4h.get("ema_bull"): up+=2.0; signals.append("4h EMA ↑")
@@ -1311,7 +1311,7 @@ async def job_tick(context):
     adv=compute_advanced_signals(list(st.c5),list(st.c1))
     direction_guess="UP" if i5.get("ema_bull") else "DOWN"
     eth_bonus,eth_desc=compute_eth_correlation(st.last_eth_klines,direction_guess) if st.last_eth_klines else (0,"N/A")
-    conf_score=compute_confluence_score(i1,i5,i15,i1h,i4h,st.fg,sess,adv,st.last_ob,st.last_liq,eth_bonus,eth_desc)
+    conf_score=compute_confluence_score(i1,i5,i15,i1h,i4h,st.fg,sess,adv,st.last_ob,st.last_liq,eth_bonus,eth_desc,st.btc24)
     mom_score=compute_momentum_score(i1,i5,i15)
     st.last_conf_score=conf_score; st.last_mom_score=mom_score
     _,_,min_mom=get_session_thresholds(sess.get("session","OVERNIGHT"), conf_score.get("score",0))
@@ -1644,7 +1644,7 @@ async def cmd_score(update,context):
     sess=session_ctx(); adv=compute_advanced_signals(list(st.c5),list(st.c1))
     direction_guess="UP" if i5.get("ema_bull") else "DOWN"
     eth_bonus,eth_desc=compute_eth_correlation(eth_klines,direction_guess) if eth_klines else (0,"ETH N/A")
-    cs=compute_confluence_score(i1,i5,i15,i1h,i4h,st.fg,sess,adv,ob,liq,eth_bonus,eth_desc)
+    cs=compute_confluence_score(i1,i5,i15,i1h,i4h,st.fg,sess,adv,ob,liq,eth_bonus,eth_desc,st.btc24)
     mom=compute_momentum_score(i1,i5,i15)
     st.last_conf_score=cs; st.last_mom_score=mom; st.last_ob=ob; st.last_liq=liq
     st.last_eth_klines=eth_klines  # ✅ Cache
@@ -1688,7 +1688,7 @@ async def cmd_signal(update,context):
     sess=session_ctx(); adv=compute_advanced_signals(list(st.c5),list(st.c1))
     direction_guess="UP" if i5.get("ema_bull") else "DOWN"
     eth_bonus,eth_desc=compute_eth_correlation(eth_klines,direction_guess) if eth_klines else (0,"ETH N/A")
-    cs=compute_confluence_score(i1,i5,i15,i1h,i4h,st.fg,sess,adv,ob,liq,eth_bonus,eth_desc)
+    cs=compute_confluence_score(i1,i5,i15,i1h,i4h,st.fg,sess,adv,ob,liq,eth_bonus,eth_desc,st.btc24)
     mom=compute_momentum_score(i1,i5,i15)
     st.last_conf_score=cs; st.last_mom_score=mom; st.last_ob=ob; st.last_liq=liq
     # ✅ v10.13f — Cherche le marché, fallback sur le cache du dernier tick
