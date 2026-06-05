@@ -15,7 +15,7 @@ from collections import deque
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 
-BOT_VERSION = "10.16b"
+BOT_VERSION = "10.17"
 
 def load_env():
     env_path = os.path.join(os.path.dirname(__file__), '.env')
@@ -706,10 +706,16 @@ def get_session_thresholds(session_name, score=0):
     ✅ v10.12f — Seuil momentum adaptatif selon le score.
     Score ≥ 13 → min_mom -1 (signaux très alignés)
     Score ≥ 15 → min_mom -2 (confluence exceptionnelle)
+    ✅ v10.17 — Mode turbo: seuils réduits si actif
     """
     min_score, min_diff, min_mom = SESSION_THRESHOLDS.get(session_name, (10, 3.5, 4))
+    # Mode turbo
+    if hasattr(st, 'turbo_until') and time.time() < st.turbo_until:
+        min_score = max(7, min_score - 2)
+        min_mom = max(2, min_mom - 1)
+        min_diff = max(1.5, min_diff - 0.5)
     # Réduit le seuil momentum si score très élevé
-    if score >= 15:
+    elif score >= 15:
         min_mom = max(2, min_mom - 2)
     elif score >= 13:
         min_mom = max(2, min_mom - 1)
@@ -1018,6 +1024,7 @@ class State:
         self.daily_start=50.0; self.daily_ts=time.time()
         self.daily_pause_until=0
         self.skipped=0; self.pass_reasons=[]
+        self.turbo_until=0  # ✅ v10.17 Mode turbo timestamp
         self.last_decision={}; self.last_conf_score={}; self.last_mom_score=0
         self.fg={"value":50,"label":"Neutral"}; self.btc24={}
         self.tick_job=self.price_job=self.macro_job=self.tp_job=self.backup_job=self.recap_job=None
@@ -1229,7 +1236,17 @@ async def job_take_profit(context):
 
 async def job_price(context):
     p=await fetch_price()
-    if p>0: st.price=p
+    if p>0:
+        # ✅ v10.17 — Détection move brutal BTC
+        if st.price>0 and not st.bet:
+            move_pct = (p - st.price) / st.price * 100
+            if abs(move_pct) >= 1.0:
+                direction = "📈 UP" if move_pct > 0 else "📉 DOWN"
+                await send(context.bot,
+                    f"⚡ *Move BTC détecté*\n"
+                    f"{direction} `{move_pct:+.2f}%` en ~30s\n"
+                    f"₿`${p:,.2f}` | Lance `/signal` pour analyser")
+        st.price=p
 
 async def job_macro(context):
     st.fg=await fetch_fear_greed(); st.btc24=await fetch_btc_24h()
@@ -1775,6 +1792,25 @@ async def cmd_trades(update,context):
         lines.append(f"\n🔄 *Actif:* `{st.bet['dir']}` `{st.bet['amount']:.2f}$` ({elapsed}min){trail}")
     await update.message.reply_text("\n".join(lines),parse_mode="Markdown")
 
+async def cmd_history(update,context):
+    """✅ v10.17 — 20 derniers trades avec détails complets"""
+    if not auth(update): return
+    trades=st.trades[-20:][::-1]
+    if not trades: await update.message.reply_text("📈 Aucun trade dans l'historique."); return
+    lines=["📋 *HISTORIQUE 20 TRADES*\n━━━━━━━━━━━━━━━━━━━━━━━━"]
+    total_pnl=0
+    for t in trades:
+        ts=datetime.fromtimestamp(t["ts"]).strftime("%d/%m %H:%M")
+        emoji="✅" if t["result"]=="WIN" else "❌"
+        mode="💰" if not t.get("paper",True) else "📄"
+        pnl=t["pnl"]; total_pnl+=pnl
+        score=t.get("score",0); sess=t.get("session","?")
+        lines.append(f"{emoji}{mode} `{t['dir']}` `{fmt(pnl)}$` score:`{score:.0f}` `{sess}` `{ts}`")
+    wins=sum(1 for t in trades if t["result"]=="WIN")
+    wr=wins/len(trades)*100
+    lines.append(f"\n📊 WR:`{wr:.0f}%` | PnL total:`{fmt(total_pnl)}$`")
+    await update.message.reply_text("\n".join(lines),parse_mode="Markdown")
+
 async def cmd_stats(update,context):
     if not auth(update): return
     total=st.wins+st.losses
@@ -1849,6 +1885,22 @@ async def cmd_cooldown(update,context):
     st.cooldown_until=0; st.consec=0; st.daily_pause_until=0
     await update.message.reply_text("✅ Cooldown + pause reset.",parse_mode="Markdown")
 
+async def cmd_turbo(update,context):
+    """✅ v10.17 — Mode turbo: seuils réduits pendant 15min"""
+    if not auth(update): return
+    if time.time() < st.turbo_until:
+        remaining = int((st.turbo_until - time.time()) / 60)
+        await update.message.reply_text(f"⚡ Turbo déjà actif — encore `{remaining}min`",parse_mode="Markdown")
+        return
+    st.turbo_until = time.time() + 15*60  # 15 minutes
+    sess = session_ctx()
+    min_score,min_diff,min_mom = get_session_thresholds(sess["session"])
+    await update.message.reply_text(
+        f"⚡ *MODE TURBO activé 15min*\n"
+        f"Seuils: score≥`{max(7,min_score-2)}` mom≥`{max(2,min_mom-1)}`\n"
+        f"Utilise `/score` pour voir les signaux en temps réel",
+        parse_mode="Markdown")
+
 async def cb(update,context):
     q=update.callback_query; await q.answer()
     h={"status":cmd_status,"ai":cmd_ai,"trades":cmd_trades,"stats":cmd_stats,
@@ -1864,7 +1916,8 @@ def main():
         ("ai",cmd_ai),("signal",cmd_signal),("score",cmd_score),("trades",cmd_trades),
         ("stats",cmd_stats),("fear",cmd_fear),("passes",cmd_passes),("market",cmd_market),
         ("balance",cmd_balance),("paper",cmd_paper),("cooldown",cmd_cooldown),("reset",cmd_reset),
-        ("setbalance",cmd_setbalance),("backup",cmd_backup),("recap",cmd_recap),("dashboard",cmd_dashboard)]:
+        ("setbalance",cmd_setbalance),("backup",cmd_backup),("recap",cmd_recap),("dashboard",cmd_dashboard),
+        ("history",cmd_history),("turbo",cmd_turbo)]:
         app.add_handler(CommandHandler(name,handler))
     app.add_handler(CallbackQueryHandler(cb))
     log.info(f"🧠 PolyBot v{BOT_VERSION} démarré")
