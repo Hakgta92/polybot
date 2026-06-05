@@ -15,7 +15,7 @@ from collections import deque
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 
-BOT_VERSION = "10.14l"
+BOT_VERSION = "10.15b"
 
 def load_env():
     env_path = os.path.join(os.path.dirname(__file__), '.env')
@@ -42,7 +42,7 @@ POLY_HOST          = "https://clob.polymarket.com"
 POLY_GAMMA         = "https://gamma-api.polymarket.com"
 POLY_CHAIN_ID      = 137
 
-MIN_BET_USD     = 1.5
+MIN_BET_USD     = 2.0
 MAX_BET_USD     = 10.0
 MAX_BET_PCT     = 0.08
 KELLY_FRACTION  = 0.25
@@ -458,22 +458,28 @@ class PolyClient:
         if client_version == "v2":
             try:
                 from py_clob_client_v2 import OrderArgs, OrderType, PartialCreateOrderOptions, Side
+                # ✅ v10.15 — Paramètres confirmés fonctionnels (testé 2026-06-05)
+                # size = montant USDC à dépenser (min 1$)
+                # price = 0.50 pour ordre market au milieu
+                # OrderType.FOK = Fill or Kill
                 side_v2 = Side.BUY if side == "BUY" else Side.SELL
+                size_val = round(max(2.0, amount_float), 2)  # min 2$ pour éviter "min size: 1"
 
-                # Essai GTC puis FOK avec différents prix
-                for order_type_v2, price_offset in [
-                    (OrderType.GTC, 0.02),   # GTC + léger slippage
-                    (OrderType.FOK, 0.05),   # FOK + plus de slippage
-                    (OrderType.GTC, 0.10),   # GTC + gros slippage
-                ]:
+                # ✅ v10.15 — Prix dynamique depuis le CLOB (pas 0.50 fixe)
+                try:
+                    token_price_resp = await self.get_token_price(token_id)
+                    if token_price_resp > 0:
+                        # Ajouter 2% de slippage pour garantir l'exécution
+                        price_val = round(min(0.99, token_price_resp * 1.02), 2)
+                    else:
+                        price_val = 0.50
+                except:
+                    price_val = 0.50
+
+                log.info(f"V2 order: token={token_id[:10]} price={price_val} size={size_val}")
+
+                for order_type_v2 in [OrderType.FOK, OrderType.GTC]:
                     try:
-                        # Prix: pour BUY on accepte jusqu'à token_price + offset
-                        # tick_size 0.01 = arrondi au centime
-                        price_val = round(min(0.99, amount_float / max(amount_float * 0.5, 1) + price_offset), 2)
-                        # En pratique: BUY à 0.99 (accepte tout prix ≤ 0.99)
-                        price_val = 0.99 if side == "BUY" else 0.01
-                        size_val = round(amount_float / price_val, 2) if price_val > 0 else amount_float
-
                         resp = self.client.create_and_post_order(
                             order_args=OrderArgs(
                                 token_id=token_id,
@@ -484,18 +490,16 @@ class PolyClient:
                             options=PartialCreateOrderOptions(tick_size="0.01"),
                             order_type=order_type_v2,
                         )
-                        log.info(f"V2 {order_type_v2} price={price_val} size={size_val} réponse: {resp}")
-                        if resp:
-                            success = resp.get("success", False) or resp.get("orderID") or resp.get("id")
-                            if success:
-                                oid = resp.get("orderID", resp.get("id", "unknown"))
-                                log.info(f"✅ Ordre V2 {order_type_v2} placé: {oid}")
-                                return oid
+                        log.info(f"V2 {order_type_v2} réponse: {resp}")
+                        if resp and resp.get("success"):
+                            oid = resp.get("orderID", resp.get("id", "unknown"))
+                            log.info(f"✅ Ordre V2 {order_type_v2} placé: {oid}")
+                            return oid
                         log.warning(f"V2 {order_type_v2} refusé: {resp}")
                     except Exception as e:
                         log.warning(f"V2 {order_type_v2} erreur: {e}")
             except Exception as e:
-                log.error(f"V2 import erreur: {e}")
+                log.error(f"V2 order erreur: {e}")
             return None
 
         # Fallback V1
@@ -756,6 +760,10 @@ def compute_confluence_score(i1,i5,i15,i1h,i4h,fg,sess,adv,ob=None,liq=None,eth_
     fgv=fg.get("value",50)
     if fgv<15: up+=1.0; signals.append(f"F&G peur extrême ({fgv})")
     elif fgv>85: dn+=1.0; signals.append(f"F&G greed extrême ({fgv})")
+    # ✅ v10.15 — Filtre tendance BTC 24h
+    btc_change=btc24.get("change_pct",0) if btc24 else 0
+    if btc_change < -3.0: dn+=2.0; signals.append(f"⚠️ BTC {btc_change:.1f}% tendance baissière forte")
+    elif btc_change > 3.0: up+=2.0; signals.append(f"⚠️ BTC +{btc_change:.1f}% tendance haussière forte")
     if i5.get("bb_squeeze"):
         signals.append("⚡ Squeeze BB")
         if up>dn: up+=0.5
@@ -1484,11 +1492,26 @@ async def cmd_status(update,context):
 
 async def cmd_balance(update,context):
     if not auth(update): return
-    w=POLY_FUNDER_WALLET or POLY_PROXY_WALLET or "?"
+    w=POLY_PROXY_WALLET or "?"
     short=f"{w[:6]}...{w[-4:]}"
+    # ✅ v10.15 — Tente de lire le solde réel via CLOB V2
+    real_balance = None
+    if poly.ready and poly.client_version == "v2":
+        try:
+            from py_clob_client_v2 import BalanceAllowanceParams
+            from py_clob_client_v2.clob_types import AssetType
+            resp = poly.client.get_balance_allowance(BalanceAllowanceParams(asset_type=AssetType.COLLATERAL))
+            if resp:
+                bal = resp.get("balance", resp.get("amount", None))
+                if bal is not None:
+                    real_balance = round(float(bal) / 1e6, 2)
+        except Exception as e:
+            log.warning(f"Balance CLOB: {e}")
+    balance_line = f"🔗 Solde CLOB:`{real_balance:.2f}$`\n" if real_balance is not None else ""
     await update.message.reply_text(
         f"💰 *Balance Bot*\n━━━━━━━━━━━━━━\n"
         f"🔑 `{short}`\n"
+        f"{balance_line}"
         f"📊 BR:`{st.bankroll:.2f}$` | ROI:`{roi()}`\n"
         f"📈 PnL:`{fmt(st.pnl)}$` | Réf:`{st.bankroll_ref:.2f}$`\n\n"
         f"💡 `/setbalance <montant>` pour sync",
