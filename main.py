@@ -15,7 +15,7 @@ from collections import deque
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 
-BOT_VERSION = "10.14k"
+BOT_VERSION = "10.14l"
 
 def load_env():
     env_path = os.path.join(os.path.dirname(__file__), '.env')
@@ -370,45 +370,28 @@ class PolyClient:
         # ✅ v10.14 — Migration vers py-clob-client-v2 (CLOB V2 depuis avril 2026)
         try:
             from py_clob_client_v2 import ClobClient as ClobClientV2, ApiCreds
-            # ✅ v10.14k — Utiliser les clés API directement depuis Railway
-            if POLY_API_KEY and POLY_API_SECRET and POLY_API_PASSPHRASE:
-                creds = ApiCreds(
-                    api_key=POLY_API_KEY,
-                    api_secret=POLY_API_SECRET,
-                    api_passphrase=POLY_API_PASSPHRASE
-                )
-                self.client = ClobClientV2(
-                    host=POLY_HOST,
-                    key=POLY_PRIVATE_KEY,
-                    chain_id=POLY_CHAIN_ID,
-                    signature_type=1,
-                    funder=POLY_PROXY_WALLET,
-                    creds=creds
-                )
-                self.ready = True
-                self.client_version = "v2"
-                log.info(f"✅ Polymarket CLOB V2 initialisé (API key: {POLY_API_KEY[:8]}...)"); return True
-            else:
-                log.warning("POLY_API_KEY manquant, tentative dérivation...")
-                self.client = ClobClientV2(
-                    host=POLY_HOST,
-                    key=POLY_PRIVATE_KEY,
-                    chain_id=POLY_CHAIN_ID,
-                    signature_type=1,
-                    funder=POLY_PROXY_WALLET
-                )
-                creds = self.client.create_or_derive_api_key()
-                self.client = ClobClientV2(
-                    host=POLY_HOST,
-                    key=POLY_PRIVATE_KEY,
-                    chain_id=POLY_CHAIN_ID,
-                    signature_type=1,
-                    funder=POLY_PROXY_WALLET,
-                    creds=creds
-                )
-                self.ready = True
-                self.client_version = "v2"
-                log.info(f"✅ Polymarket CLOB V2 initialisé (dérivé)"); return True
+            # ✅ v10.14l — signature_type=3 (POLY_1271) + funder=deposit wallet
+            # Selon support Polymarket: funder doit être le deposit wallet (magic.link proxy)
+            deposit_wallet = POLY_PROXY_WALLET  # 0xa565... wallet qui détient les fonds pUSD
+            self.client = ClobClientV2(
+                host=POLY_HOST,
+                key=POLY_PRIVATE_KEY,
+                chain_id=POLY_CHAIN_ID,
+                signature_type=3,  # POLY_1271 = deposit wallet flow
+                funder=deposit_wallet
+            )
+            creds = self.client.create_or_derive_api_key()
+            self.client = ClobClientV2(
+                host=POLY_HOST,
+                key=POLY_PRIVATE_KEY,
+                chain_id=POLY_CHAIN_ID,
+                signature_type=3,
+                funder=deposit_wallet,
+                creds=creds
+            )
+            self.ready = True
+            self.client_version = "v2"
+            log.info(f"✅ Polymarket CLOB V2 initialisé (sig_type=3, deposit={deposit_wallet[:10]}...)"); return True
         except ImportError:
             log.warning("py-clob-client-v2 non installé, fallback v1")
         except Exception as e:
