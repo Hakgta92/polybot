@@ -15,7 +15,7 @@ from collections import deque
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 
-BOT_VERSION = "10.19b"
+BOT_VERSION = "10.19c"
 
 def load_env():
     env_path = os.path.join(os.path.dirname(__file__), '.env')
@@ -1548,6 +1548,14 @@ async def job_tick(context):
             except: pass
         else:
             st.skipped+=1; st.pass_reasons.append({"ts":int(time.time()),"reason":"Aucun marché actif"}); return
+    # ✅ v10.19c — Vérifier payout AVANT d'appeler Claude (économie API)
+    ppu=round(1/tpu,2) if tpu>0 else 0
+    ppd=round(1/tpd,2) if tpd>0 else 0
+    best_payout = ppu if conf_score["direction"]=="UP" else ppd
+    if best_payout < 1.3 and not st.paper_mode:
+        st.skipped+=1
+        st.pass_reasons.append({"ts":int(time.time()),"reason":f"Payout {best_payout:.2f}<1.3 (skip Claude)"})
+        return
     dec=await claude_decide(i1,i5,i15,i1h,i4h,adv,st.trades[-15:],st.bankroll,st.consec,
                             st.fg,st.btc24,sess,conf_score,mom_score,tpu,tpd,st.last_ob,st.last_liq,eth_desc)
     st.last_decision=dec
