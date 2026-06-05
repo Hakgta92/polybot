@@ -15,7 +15,7 @@ from collections import deque
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 
-BOT_VERSION = "10.19"
+BOT_VERSION = "10.19b"
 
 def load_env():
     env_path = os.path.join(os.path.dirname(__file__), '.env')
@@ -42,7 +42,7 @@ POLY_HOST          = "https://clob.polymarket.com"
 POLY_GAMMA         = "https://gamma-api.polymarket.com"
 POLY_CHAIN_ID      = 137
 
-MIN_BET_USD     = 2.0
+MIN_BET_USD     = 5.0  # ✅ v10.19b — Minimum Polymarket CLOB V2
 MAX_BET_USD     = 10.0
 MAX_BET_PCT     = 0.08
 KELLY_FRACTION  = 0.25
@@ -473,7 +473,7 @@ class PolyClient:
                 # price = 0.50 pour ordre market au milieu
                 # OrderType.FOK = Fill or Kill
                 side_v2 = Side.BUY if side == "BUY" else Side.SELL
-                size_val = round(max(2.0, amount_float), 2)  # min 2$ pour éviter "min size: 1"
+                size_val = round(max(5.0, amount_float), 2)  # min 5$ minimum Polymarket CLOB V2
 
                 # ✅ v10.19 — Prix dynamique avec slippage adaptatif
                 try:
@@ -492,7 +492,7 @@ class PolyClient:
 
                 log.info(f"V2 order: token={token_id[:10]} price={price_val} size={size_val}")
 
-                for order_type_v2 in [OrderType.FOK, OrderType.GTC]:
+                for order_type_v2 in [OrderType.FAK, OrderType.GTC]:  # FAK = Fill and Kill (partiel OK)
                     try:
                         resp = self.client.create_and_post_order(
                             order_args=OrderArgs(
