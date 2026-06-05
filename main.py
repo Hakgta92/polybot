@@ -15,7 +15,7 @@ from collections import deque
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 
-BOT_VERSION = "10.18"
+BOT_VERSION = "10.18b"
 
 def load_env():
     env_path = os.path.join(os.path.dirname(__file__), '.env')
@@ -535,12 +535,23 @@ class PolyClient:
     async def sell_position(self,token_id,shares):
         if not self.ready or not self.client: return None
         try:
-            from py_clob_client.clob_types import MarketOrderArgs,OrderType
-            from py_clob_client.order_builder.constants import SELL
-            mo=MarketOrderArgs(token_id=token_id,amount=shares,side=SELL,order_type=OrderType.FOK)
-            resp=self.client.post_order(self.client.create_market_order(mo),OrderType.FOK)
+            from py_clob_client_v2 import OrderArgs, OrderType, Side, PartialCreateOrderOptions
+            # Vendre = BUY du côté opposé ou SELL du token
+            resp = self.client.create_and_post_order(
+                order_args=OrderArgs(token_id=token_id, price=0.99, side=Side.SELL, size=round(float(shares),2)),
+                options=PartialCreateOrderOptions(tick_size="0.01"),
+                order_type=OrderType.FOK,
+            )
+            log.info(f"sell_position V2: {resp}")
             return resp if resp and resp.get("success") else None
-        except Exception as e: log.error(f"sell_position: {e}"); return None
+        except Exception as e:
+            err = str(e)
+            if "No orderbook" in err or "404" in err:
+                # ✅ Slot expiré = résolution automatique par Polymarket
+                log.info("sell_position: slot expiré, résolution auto Polymarket")
+                return {"success": True, "auto_resolved": True}
+            log.error(f"sell_position: {e}")
+            return None
 
 poly=PolyClient()
 
@@ -1215,16 +1226,60 @@ async def job_daily_recap(context):
         f"_Bot continue demain — bonne nuit 🌙_")
 
 async def job_check_expiry(context):
-    """✅ v10.12 — Alerte 1min avant expiration d'un bet réel"""
-    if not st.bet or st.paper_mode or st.bet_expiry<=0: return
-    remaining=st.bet_expiry-time.time()
-    if 50<=remaining<=70:  # Entre 50s et 70s avant expiration
-        current_price=await poly.get_token_price(st.active_token_id) if st.active_token_id else 0
-        gain_mult=current_price/st.entry_token_price if st.entry_token_price>0 and current_price>0 else 0
-        await send(context.bot,
-            f"⏰ *Position expire dans ~1min*\n"
-            f"`{st.bet['dir']}` | Token:`{current_price:.3f}$` | x`{gain_mult:.2f}`\n"
-            f"BTC:`${st.price:,.2f}`")
+    """✅ v10.18b — Alerte + clôture automatique quand slot expiré"""
+    if not st.bet or st.paper_mode: return
+    now = time.time()
+
+    # Alerte 1min avant expiration
+    if st.bet_expiry > 0:
+        remaining = st.bet_expiry - now
+        if 50 <= remaining <= 70:
+            current_price = await poly.get_token_price(st.active_token_id) if st.active_token_id else 0
+            gain_mult = current_price/st.entry_token_price if st.entry_token_price>0 and current_price>0 else 0
+            await send(context.bot,
+                f"⏰ *Position expire dans ~1min*\n"
+                f"`{st.bet['dir']}` | Token:`{current_price:.3f}$` | x`{gain_mult:.2f}`\n"
+                f"BTC:`${st.price:,.2f}`")
+
+        # ✅ Clôture automatique 60s après expiration
+        if remaining < -60:
+            log.info("Slot expiré depuis >60s — clôture automatique")
+            clob_bal = await fetch_clob_balance()
+            bet = st.bet
+            if clob_bal and clob_bal > 0:
+                prev_bal = st.bankroll
+                gross = round(clob_bal - prev_bal, 2)
+                won = gross >= 0
+                st.bankroll = clob_bal
+            else:
+                gross = 0.0; won = False
+            st.pnl += gross
+            if won:
+                st.wins += 1; st.consec = 0
+                st.streak = st.streak+1 if st.streak>=0 else 1
+                st.best_streak = max(st.best_streak, st.streak)
+                result_txt = "WIN"
+            else:
+                st.losses += 1; st.consec += 1
+                st.streak = st.streak-1 if st.streak<=0 else -1
+                st.worst_streak = min(st.worst_streak, st.streak)
+                result_txt = "LOSS"
+                if st.consec >= MAX_CONSEC_LOSS:
+                    st.cooldown_until = now + COOLDOWN_MIN*60
+            st.trades.append({"dir":bet["dir"],"amount":bet["amount"],"pnl":round(gross,4),
+                "conf":bet["conf"],"result":result_txt,"entry":bet["entry"],"exit":st.price,
+                "reasoning":"Résolution auto slot expiré","paper":False,"ts":int(now),
+                "score":bet.get("score",0),"fg_value":st.fg.get("value",50),
+                "session":bet.get("session","?"),"aligned_15h1h":True})
+            st.bet=None; st.active_token_id=None; st.active_order_id=None
+            st.shares_bought=0; st.entry_token_price=0
+            st.token_price_peak=0; st.trailing_active=False; st.bet_expiry=0
+            emoji="✅" if won else "❌"
+            await send(context.bot,
+                f"{emoji} *Trade résolu* (slot expiré)\n"
+                f"`{bet['dir']}` | PnL:`{fmt(gross)}$`\n"
+                f"BR:`{st.bankroll:.2f}$` | ROI:`{roi()}`")
+            st.backup()
 
 async def job_take_profit(context):
     """✅ v10.16 — Vente anticipée si x2/x3/x4 avant résolution du slot"""
