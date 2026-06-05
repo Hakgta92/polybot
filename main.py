@@ -15,7 +15,7 @@ from collections import deque
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 
-BOT_VERSION = "10.15b"
+BOT_VERSION = "10.15c"
 
 def load_env():
     env_path = os.path.join(os.path.dirname(__file__), '.env')
@@ -856,6 +856,22 @@ def wr_by_session(trades, days=7):
         sessions[s]["pnl"]+=t["pnl"]
     return sessions
 
+async def fetch_clob_balance():
+    """✅ v10.15c — Lit le solde réel depuis Polymarket CLOB V2"""
+    if not poly.ready or poly.client_version != "v2":
+        return None
+    try:
+        from py_clob_client_v2 import BalanceAllowanceParams
+        from py_clob_client_v2.clob_types import AssetType
+        resp = poly.client.get_balance_allowance(BalanceAllowanceParams(asset_type=AssetType.COLLATERAL))
+        if resp:
+            bal = resp.get("balance", resp.get("amount", None))
+            if bal is not None:
+                return round(float(bal) / 1e6, 2)
+    except Exception as e:
+        log.warning(f"fetch_clob_balance: {e}")
+    return None
+
 async def fetch_price():
     sources=[("Kraken","https://api.kraken.com/0/public/Ticker?pair=XBTUSD",lambda d:float(d["result"]["XXBTZUSD"]["c"][0])),
              ("Binance","https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT",lambda d:float(d["price"]))]
@@ -1214,6 +1230,11 @@ async def job_tick(context):
                 "session":bet.get("session","?"),
                 "aligned_15h1h":i15_n.get("ema_bull")==i1h_n.get("ema_bull")})
             st.bet=None; st.token_price_peak=0; st.trailing_active=False; st.bet_expiry=0
+            # Auto-sync balance après trade
+            clob_bal = await fetch_clob_balance()
+            if clob_bal is not None and clob_bal > 0:
+                st.bankroll = clob_bal
+                log.info(f"Balance sync après trade: {clob_bal:.2f}$")
             cd_msg=f"\n⏸ Cooldown {COOLDOWN_MIN}min" if in_cd() else ""
             await send(context.bot,f"{'✅' if won else '❌'} *Trade clôturé* [📄]\n`{bet['dir']}` `${bet['entry']:,.0f}`→`${st.price:,.0f}`\nPnL:`{'+' if gross>=0 else ''}{gross:.2f}$` BR:`{st.bankroll:.2f}` ROI:`{roi()}`{cd_msg}")
             st.backup()
@@ -1350,6 +1371,14 @@ async def cmd_run(update,context):
     st.recap_job=context.job_queue.run_repeating(job_daily_recap,interval=3600,first=60)
     context.job_queue.run_repeating(job_check_expiry,interval=30,first=15)
     st.fg=await fetch_fear_greed(); st.btc24=await fetch_btc_24h(); sess=session_ctx()
+    # ✅ v10.15c — Auto-sync balance depuis CLOB V2
+    clob_bal = await fetch_clob_balance()
+    if clob_bal is not None and clob_bal > 0:
+        st.bankroll = clob_bal
+        st.bankroll_ref = clob_bal
+        st.daily_start = clob_bal
+        log.info(f"✅ Balance auto-sync: {clob_bal:.2f}$")
+        await send(context.bot, f"💰 Balance auto-sync: `{clob_bal:.2f}$`")
     st.last_ob=await fetch_orderbook_imbalance()
     st.last_liq=await fetch_liquidations()
     st.last_eth_klines=await fetch_eth_klines("5m",30)
