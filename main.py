@@ -15,7 +15,7 @@ from collections import deque
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 
-BOT_VERSION = "10.15c"
+BOT_VERSION = "10.16"
 
 def load_env():
     env_path = os.path.join(os.path.dirname(__file__), '.env')
@@ -83,12 +83,22 @@ logging.basicConfig(format="%(asctime)s [%(levelname)s] %(message)s", level=logg
     handlers=[logging.FileHandler("polybot_v10.log"), logging.StreamHandler()])
 log = logging.getLogger(__name__)
 
-def kelly_bet(bankroll, win_prob, payout_mult):
+def kelly_bet(bankroll, win_prob, payout_mult, token_price=0.5):
+    """
+    ✅ v10.16 — Kelly adaptatif au vrai prix du token.
+    token_price: prix actuel du token (0.01-0.99)
+    payout_mult: 1/token_price
+    """
     if win_prob<=0 or payout_mult<=1: return MIN_BET_USD
     b=payout_mult-1; q=1-win_prob
     kp=(win_prob*b-q)/b
     if kp<=0: return 0.0
-    return round(max(MIN_BET_USD, min(bankroll*min(kp*KELLY_FRACTION, MAX_BET_PCT), MAX_BET_USD)), 2)
+    # Ajustement selon liquidité du marché (token proche de 0 ou 1 = moins liquide)
+    liquidity_factor = 1.0
+    if token_price < 0.15 or token_price > 0.85:
+        liquidity_factor = 0.7  # Réduire la mise sur marchés très déséquilibrés
+    raw_bet = bankroll * min(kp * KELLY_FRACTION * liquidity_factor, MAX_BET_PCT)
+    return round(max(MIN_BET_USD, min(raw_bet, MAX_BET_USD)), 2)
 
 # ─── DONNÉES AVANCÉES ──────────────────────────────────────────────────────
 async def fetch_orderbook_imbalance():
@@ -678,6 +688,9 @@ def compute_advanced_signals(candles_5m,candles_1m):
     return {"divergence":div,"engulfing":eng,"vwap_break":vb,"signals":signals,"score":score,
             "bias":"UP" if score>0 else "DOWN" if score<0 else None}
 
+# ✅ v10.16 — Watchdog: timestamp du dernier tick actif
+_last_tick_ts = 0
+
 def session_ctx():
     h=(datetime.utcnow().hour+2)%24
     if   14<=h<17: return {"session":"US_OPEN",     "quality":"EXCELLENT","score_bonus":2}
@@ -1091,8 +1104,11 @@ async def job_backup(context):
     st.backup()
 
 async def job_daily_recap(context):
-    """✅ v10.12 — Résumé automatique tous les jours à 22h Paris"""
+    """✅ v10.16 — Résumé 22h + rapport hebdo dimanche + alerte bot arrêté"""
     h_paris=(datetime.utcnow().hour+2)%24
+    # Alerte si le tick n'a pas tourné depuis >10min (bot potentiellement bloqué)
+    if _last_tick_ts > 0 and (time.time() - _last_tick_ts) > 600:
+        await send(context.bot, f"⚠️ *Alerte* — Dernier tick il y a `{int((time.time()-_last_tick_ts)/60)}min`. Bot potentiellement bloqué!")
     if h_paris!=22: return  # Tourne toutes les heures, envoie seulement à 22h
     now=time.time(); cutoff=now-86400
     trades_24h=[t for t in st.trades if t.get("ts",0)>=cutoff]
@@ -1126,42 +1142,88 @@ async def job_check_expiry(context):
             f"BTC:`${st.price:,.2f}`")
 
 async def job_take_profit(context):
+    """✅ v10.16 — Vente anticipée si x2/x3/x4 avant résolution du slot"""
     if not st.bet or not st.active_token_id or st.paper_mode: return
     try:
-        current_price=await poly.get_token_price(st.active_token_id)
-        if current_price<=0 or st.entry_token_price<=0: return
-        gain_mult=current_price/st.entry_token_price
-        if gain_mult>st.token_price_peak:
-            st.token_price_peak=gain_mult
-            if gain_mult>=TRAILING_PEAK_MULT and not st.trailing_active:
-                st.trailing_active=True
-                await send(context.bot,f"🎯 *Trailing stop activé* x`{gain_mult:.2f}`\nVente auto si retombe sous x`{TRAILING_STOP_MULT:.1f}`")
-        sell_reason=None
-        if gain_mult>=TAKE_PROFIT_MULT:
-            sell_reason=f"Take profit x{gain_mult:.2f}"
-        elif st.trailing_active and st.token_price_peak>0:
-            trail_threshold=max(TRAILING_STOP_MULT, st.token_price_peak*0.87)
-            if gain_mult<trail_threshold:
-                sell_reason=f"Trailing stop (peak x{st.token_price_peak:.2f}→x{gain_mult:.2f})"
-        if sell_reason:
-            result=await poly.sell_position(st.active_token_id,st.shares_bought)
-            if result:
-                gross=round((current_price-st.entry_token_price)*st.shares_bought,2)
-                st.bankroll=max(0.0,st.bankroll+gross); st.pnl+=gross
-                st.wins+=1; st.consec=0; st.streak=st.streak+1 if st.streak>=0 else 1
-                st.best_streak=max(st.best_streak,st.streak)
-                bet=st.bet
-                st.trades.append({"dir":bet["dir"],"amount":bet["amount"],"pnl":round(gross,4),
-                    "conf":bet["conf"],"result":"WIN","entry":bet["entry"],"exit":st.price,
-                    "reasoning":sell_reason,"paper":False,"ts":int(time.time()),
-                    "score":bet.get("score",0),"fg_value":st.fg.get("value",50),"aligned_15h1h":True,
-                    "session":bet.get("session","?")})
-                st.bet=None; st.active_token_id=None; st.active_order_id=None
-                st.shares_bought=0; st.entry_token_price=0
-                st.token_price_peak=0; st.trailing_active=False; st.bet_expiry=0
+        current_price = await poly.get_token_price(st.active_token_id)
+        if current_price <= 0 or st.entry_token_price <= 0: return
+
+        gain_mult = current_price / st.entry_token_price
+
+        # Mise à jour du peak
+        if gain_mult > st.token_price_peak:
+            st.token_price_peak = gain_mult
+            if gain_mult >= TRAILING_PEAK_MULT and not st.trailing_active:
+                st.trailing_active = True
                 await send(context.bot,
-                    f"🎯 *VENTE* — {sell_reason}\n"
-                    f"`{bet['dir']}` | `+{gross:.2f} USDC`\nBR:`{st.bankroll:.2f}` | ROI:`{roi()}`")
+                    f"🎯 *Trailing stop activé* x`{gain_mult:.2f}`\n"
+                    f"Vente auto si retombe sous x`{TRAILING_STOP_MULT:.1f}`")
+
+        sell_reason = None
+        sell_pct = 100  # % des shares à vendre
+
+        # ✅ Paliers de vente anticipée basés sur le multiplicateur TOKEN
+        # Token à 0.20$ → x5 potentiel. Si le prix monte à 0.60$ → x3 → on vend
+        if current_price >= 0.95:
+            # Token quasi résolu à notre faveur → vendre tout immédiatement
+            sell_reason = f"✅ Résolution imminente (token={current_price:.2f}$)"
+            sell_pct = 100
+        elif gain_mult >= 4.0:
+            sell_reason = f"🚀 x{gain_mult:.1f} — Take profit x4"
+            sell_pct = 100
+        elif gain_mult >= 3.0 and st.token_price_peak >= 3.0:
+            sell_reason = f"💰 x{gain_mult:.1f} — Take profit x3"
+            sell_pct = 80  # Vendre 80%, garder 20% pour plus
+        elif gain_mult >= 2.0:
+            sell_reason = f"💰 x{gain_mult:.1f} — Take profit x2"
+            sell_pct = 60  # Vendre 60%, garder 40%
+        elif gain_mult >= TAKE_PROFIT_MULT:
+            sell_reason = f"Take profit x{gain_mult:.2f}"
+            sell_pct = 100
+        elif st.trailing_active and st.token_price_peak > 0:
+            trail_threshold = max(TRAILING_STOP_MULT, st.token_price_peak * 0.87)
+            if gain_mult < trail_threshold:
+                sell_reason = f"Trailing stop (peak x{st.token_price_peak:.2f}→x{gain_mult:.2f})"
+                sell_pct = 100
+
+        if sell_reason:
+            shares_to_sell = round(st.shares_bought * sell_pct / 100, 4)
+            result = await poly.sell_position(st.active_token_id, shares_to_sell)
+            if result:
+                gross = round((current_price - st.entry_token_price) * shares_to_sell, 2)
+                # Sync balance CLOB
+                clob_bal = await fetch_clob_balance()
+                if clob_bal and clob_bal > 0:
+                    st.bankroll = clob_bal
+                else:
+                    st.bankroll = max(0.0, st.bankroll + gross)
+                st.pnl += gross
+                bet = st.bet
+
+                if sell_pct == 100:
+                    # Trade complet
+                    st.wins += 1; st.consec = 0
+                    st.streak = st.streak + 1 if st.streak >= 0 else 1
+                    st.best_streak = max(st.best_streak, st.streak)
+                    st.trades.append({"dir": bet["dir"], "amount": bet["amount"],
+                        "pnl": round(gross, 4), "conf": bet["conf"], "result": "WIN",
+                        "entry": bet["entry"], "exit": st.price, "reasoning": sell_reason,
+                        "paper": False, "ts": int(time.time()), "score": bet.get("score", 0),
+                        "fg_value": st.fg.get("value", 50), "aligned_15h1h": True,
+                        "session": bet.get("session", "?")})
+                    st.bet = None; st.active_token_id = None; st.active_order_id = None
+                    st.shares_bought = 0; st.entry_token_price = 0
+                    st.token_price_peak = 0; st.trailing_active = False; st.bet_expiry = 0
+                else:
+                    # Vente partielle — mettre à jour les shares restantes
+                    st.shares_bought = round(st.shares_bought - shares_to_sell, 4)
+                    # Activer trailing sur le reste
+                    st.trailing_active = True
+
+                await send(context.bot,
+                    f"🎯 *VENTE {sell_pct}%* — {sell_reason}\n"
+                    f"`{bet['dir']}` | `+{gross:.2f} USDC`\n"
+                    f"BR:`{st.bankroll:.2f}` | ROI:`{roi()}`")
                 st.backup()
     except Exception as e: log.error(f"job_take_profit: {e}")
 
@@ -1197,6 +1259,8 @@ async def job_tick(context):
     if slot_pos < 15:
         return
 
+    global _last_tick_ts
+    _last_tick_ts = time.time()
     paused=check_daily()
     if paused:
         remaining=int((st.daily_pause_until-time.time())/60)
