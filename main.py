@@ -15,7 +15,7 @@ from collections import deque
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 
-BOT_VERSION = "10.19c"
+BOT_VERSION = "10.19d"
 
 def load_env():
     env_path = os.path.join(os.path.dirname(__file__), '.env')
@@ -2086,6 +2086,56 @@ async def cmd_cooldown(update,context):
     st.cooldown_until=0; st.consec=0; st.daily_pause_until=0
     await update.message.reply_text("✅ Cooldown + pause reset.",parse_mode="Markdown")
 
+async def cmd_sell(update,context):
+    """✅ v10.19d — Vente manuelle immédiate de la position active"""
+    if not auth(update): return
+    if not st.bet:
+        await update.message.reply_text("❌ Aucune position active."); return
+    if st.paper_mode:
+        await update.message.reply_text("❌ Paper mode — pas de vente réelle."); return
+    if not st.active_token_id:
+        await update.message.reply_text("❌ Pas de token actif."); return
+
+    await update.message.reply_text("⏳ Vente en cours...")
+    current_price = await poly.get_token_price(st.active_token_id)
+    gain_mult = current_price/st.entry_token_price if st.entry_token_price>0 and current_price>0 else 0
+
+    result = await poly.sell_position(st.active_token_id, st.shares_bought)
+    if result:
+        clob_bal = await fetch_clob_balance()
+        bet = st.bet
+        if clob_bal and clob_bal > 0:
+            gross = round(clob_bal - st.bankroll, 2)
+            st.bankroll = clob_bal
+        else:
+            gross = round((current_price - st.entry_token_price) * st.shares_bought, 2)
+            st.bankroll = max(0.0, st.bankroll + gross)
+        st.pnl += gross
+        won = gross >= 0
+        if won:
+            st.wins += 1; st.consec = 0
+            st.streak = st.streak+1 if st.streak>=0 else 1
+            st.best_streak = max(st.best_streak, st.streak)
+        else:
+            st.losses += 1; st.consec += 1
+        st.trades.append({"dir":bet["dir"],"amount":bet["amount"],"pnl":round(gross,4),
+            "conf":bet["conf"],"result":"WIN" if won else "LOSS",
+            "entry":bet["entry"],"exit":st.price,"reasoning":"Vente manuelle /sell",
+            "paper":False,"ts":int(time.time()),"score":bet.get("score",0),
+            "fg_value":st.fg.get("value",50),"session":bet.get("session","?"),"aligned_15h1h":True})
+        st.bet=None; st.active_token_id=None; st.active_order_id=None
+        st.shares_bought=0; st.entry_token_price=0
+        st.token_price_peak=0; st.trailing_active=False; st.bet_expiry=0
+        emoji = "✅" if won else "❌"
+        await update.message.reply_text(
+            f"{emoji} *Vente manuelle*\n"
+            f"`{bet['dir']}` | x`{gain_mult:.2f}` | PnL:`{fmt(gross)}$`\n"
+            f"BR:`{st.bankroll:.2f}$` | ROI:`{roi()}`",
+            parse_mode="Markdown")
+        st.backup()
+    else:
+        await update.message.reply_text("⚠️ Vente échouée — réessaie ou attends la résolution auto.")
+
 async def cmd_turbo(update,context):
     """✅ v10.17 — Mode turbo: seuils réduits pendant 15min"""
     if not auth(update): return
@@ -2118,7 +2168,7 @@ def main():
         ("stats",cmd_stats),("fear",cmd_fear),("passes",cmd_passes),("market",cmd_market),
         ("balance",cmd_balance),("paper",cmd_paper),("cooldown",cmd_cooldown),("reset",cmd_reset),
         ("setbalance",cmd_setbalance),("backup",cmd_backup),("recap",cmd_recap),("dashboard",cmd_dashboard),
-        ("history",cmd_history),("turbo",cmd_turbo)]:
+        ("history",cmd_history),("turbo",cmd_turbo),("sell",cmd_sell)]:
         app.add_handler(CommandHandler(name,handler))
     app.add_handler(CallbackQueryHandler(cb))
     log.info(f"🧠 PolyBot v{BOT_VERSION} démarré")
