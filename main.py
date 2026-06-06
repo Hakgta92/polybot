@@ -15,7 +15,7 @@ from collections import deque
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 
-BOT_VERSION = "10.19f"
+BOT_VERSION = "10.20"
 
 def load_env():
     env_path = os.path.join(os.path.dirname(__file__), '.env')
@@ -42,7 +42,7 @@ POLY_HOST          = "https://clob.polymarket.com"
 POLY_GAMMA         = "https://gamma-api.polymarket.com"
 POLY_CHAIN_ID      = 137
 
-MIN_BET_USD     = 5.0  # ✅ v10.19b — Minimum Polymarket CLOB V2
+MIN_BET_USD     = 5.0  # ✅ v10.19g — Min 5$
 MAX_BET_USD     = 10.0
 MAX_BET_PCT     = 0.08
 KELLY_FRACTION  = 0.25
@@ -55,6 +55,8 @@ POLY_FEE            = 0.02
 MAX_CONSEC_LOSS     = 2
 COOLDOWN_MIN        = 25
 MAX_TRADES_PER_H    = 3
+CONSERVATIVE_AFTER_LOSSES = 3   # ✅ v10.20 — Mode conservateur après N pertes
+BOOST_AFTER_WINS = 5            # ✅ v10.20 — Augmenter mises après N wins
 DAILY_LOSS_MAX      = 0.15
 DAILY_PAUSE_H       = 2
 
@@ -473,7 +475,7 @@ class PolyClient:
                 # price = 0.50 pour ordre market au milieu
                 # OrderType.FOK = Fill or Kill
                 side_v2 = Side.BUY if side == "BUY" else Side.SELL
-                size_val = round(max(5.0, amount_float), 2)  # min 5$ minimum Polymarket CLOB V2
+                size_val = round(max(5.0, amount_float), 2)  # min 5$
 
                 # ✅ v10.19 — Prix dynamique avec slippage adaptatif
                 try:
@@ -616,6 +618,46 @@ def williams_r(closes,highs,lows,period=14):
     hi,lo=max(highs[-period:]),min(lows[-period:])
     return round(-100*(hi-closes[-1])/(hi-lo),1) if hi!=lo else -50.0
 
+def adx_calc(candles, period=14):
+    """
+    ✅ v10.20 — ADX (Average Directional Index)
+    ADX > 25 = tendance forte → trade
+    ADX < 20 = range/consolidation → éviter
+    """
+    if len(candles) < period + 2: return 20.0, 0.0, 0.0
+    highs = [c["high"] for c in candles]
+    lows = [c["low"] for c in candles]
+    closes = [c["close"] for c in candles]
+    
+    plus_dm, minus_dm, tr_list = [], [], []
+    for i in range(1, len(candles)):
+        h_diff = highs[i] - highs[i-1]
+        l_diff = lows[i-1] - lows[i]
+        plus_dm.append(max(h_diff, 0) if h_diff > l_diff else 0)
+        minus_dm.append(max(l_diff, 0) if l_diff > h_diff else 0)
+        tr = max(highs[i]-lows[i], abs(highs[i]-closes[i-1]), abs(lows[i]-closes[i-1]))
+        tr_list.append(tr)
+    
+    def smooth(values, p):
+        s = sum(values[:p])
+        result = [s]
+        for v in values[p:]:
+            s = s - s/p + v
+            result.append(s)
+        return result
+    
+    atr_s = smooth(tr_list, period)
+    pdm_s = smooth(plus_dm, period)
+    mdm_s = smooth(minus_dm, period)
+    
+    pdi = [100*p/a if a>0 else 0 for p,a in zip(pdm_s, atr_s)]
+    mdi = [100*m/a if a>0 else 0 for m,a in zip(mdm_s, atr_s)]
+    dx = [100*abs(p-m)/(p+m) if (p+m)>0 else 0 for p,m in zip(pdi, mdi)]
+    
+    if len(dx) < period: return 20.0, pdi[-1] if pdi else 0, mdi[-1] if mdi else 0
+    adx_val = sum(dx[-period:]) / period
+    return round(adx_val, 1), round(pdi[-1], 1), round(mdi[-1], 1)
+
 def vwap_calc(candles):
     if not candles: return 0
     tv=sum(c["vol"] for c in candles)
@@ -689,6 +731,7 @@ def compute_ind(candles):
     stk,std=stoch(c,h,l); wr_v=williams_r(c,h,l); vw=vwap_calc(candles[-20:])
     av=sum(v[-10:])/10 if len(v)>=10 else v[-1]; mom=c[-1]-c[-6] if len(c)>=6 else 0
     sup,res=pivot_sr(candles)
+    adx_v, pdi_v, mdi_v = adx_calc(candles)
     return {"price":round(price,2),"rsi_7":r7,"rsi_14":r14,"ema9":round(e9,2),"ema21":round(e21,2),
         "ema50":round(e50,2),"slope_e9":ema_slope(c,9),"slope_e21":ema_slope(c,21),
         "macd_hist":hist,"macd_line":ml,"macd_cross":cross,"bb_low":bb_l,"bb_mid":bb_m,
@@ -696,7 +739,8 @@ def compute_ind(candles):
         "stoch_k":stk,"stoch_d":std,"williams_r":wr_v,"vwap":vw,"above_vwap":price>vw,
         "vol_ratio":round(v[-1]/av,2) if av else 1.0,"vol_spike":detect_volume_spike(candles),
         "consolidation":detect_consolidation(candles),"momentum":round(mom,2),
-        "ema_bull":e9>e21,"ema_bull_strong":e9>e21 and e21>e50,"supports":sup,"resistances":res}
+        "ema_bull":e9>e21,"ema_bull_strong":e9>e21 and e21>e50,"supports":sup,"resistances":res,
+        "adx":adx_v,"pdi":pdi_v,"mdi":mdi_v}
 
 def compute_advanced_signals(candles_5m,candles_1m):
     div=detect_divergence(candles_5m)
@@ -733,8 +777,13 @@ def get_session_thresholds(session_name, score=0):
     ✅ v10.17 — Mode turbo: seuils réduits si actif
     """
     min_score, min_diff, min_mom = SESSION_THRESHOLDS.get(session_name, (10, 3.5, 4))
+    # Mode conservateur après pertes
+    if hasattr(st, 'conservative_until') and time.time() < st.conservative_until:
+        min_score = min_score + 2
+        min_mom = min_mom + 1
+        min_diff = min_diff + 0.5
     # Mode turbo
-    if hasattr(st, 'turbo_until') and time.time() < st.turbo_until:
+    elif hasattr(st, 'turbo_until') and time.time() < st.turbo_until:
         min_score = max(7, min_score - 2)
         min_mom = max(2, min_mom - 1)
         min_diff = max(1.5, min_diff - 0.5)
@@ -832,11 +881,16 @@ def compute_confluence_score(i1,i5,i15,i1h,i4h,fg,sess,adv,ob=None,liq=None,eth_
     # ✅ Score provisoire pour adapter le seuil momentum
     direction_tmp="UP" if up>=dn else "DOWN"
     score_tmp=round(up if up>=dn else dn,1)
+    # ✅ v10.20 — Probabilité implicite calculée
+    total_score = up + dn
+    prob_up = round(up/total_score, 3) if total_score > 0 else 0.5
+    prob_dn = round(dn/total_score, 3) if total_score > 0 else 0.5
     min_score,min_diff,min_mom=get_session_thresholds(sess.get("session","OVERNIGHT"), score_tmp)
     return {"score_up":round(up,1),"score_dn":round(dn,1),"score":score,"diff":diff,
             "direction":direction,"signals":signals[:10],"min_score":min_score,
             "min_diff":min_diff,"min_mom":min_mom,
-            "tradeable":score>=min_score and diff>=min_diff}
+            "tradeable":score>=min_score and diff>=min_diff,
+            "prob_up":prob_up,"prob_dn":prob_dn}
 
 def compute_momentum_score(i1,i5,i15):
     score=0.0; r5=i5.get("rsi_14",50)
@@ -1069,6 +1123,7 @@ async def claude_decide(i1,i5,i15,i1h,i4h,adv,trades,bankroll,consec,fg,btc24,se
 BTC:${i5.get('price',0):,.2f} | 24h:{btc24.get('change_pct',0):+.2f}% | F&G:{fg['value']}/100 | {sess['session']} {h_paris}h | {news_txt}
 UP:{tpu:.3f}$→x{ppu}(Kelly≈{kelly_up:.2f}$) | DOWN:{tpd:.3f}$→x{ppd}(Kelly≈{kelly_dn:.2f}$)
 Score:{conf_score['direction']} {conf_score['score']:.1f}/{min_score} Diff:{conf_score['diff']}/{min_diff} Tradeable:{'OUI' if conf_score['tradeable'] else 'NON'}
+EdgeUP:{round((conf_score.get('prob_up',0.5)-tpu)*100,1)}% EdgeDN:{round((conf_score.get('prob_dn',0.5)-tpd)*100,1)}%
 Mom:{mom_score}/10(seuil:{min_mom}) | ETH:{eth_desc} | {ob_txt} | {liq_txt}
 Signaux:{sigs_txt}
 5m RSI:{i5.get('rsi_14',50)} MACD:{i5.get('macd_hist',0):+.4f} Stoch:{i5.get('stoch_k',50)} Vol:x{i5.get('vol_ratio',1):.1f}
@@ -1126,6 +1181,8 @@ class State:
         self.daily_pause_until=0
         self.skipped=0; self.pass_reasons=[]
         self.turbo_until=0  # ✅ v10.17 Mode turbo timestamp
+        self.conservative_until=0  # ✅ v10.20 Mode conservateur après pertes
+        self.win_streak_count=0  # ✅ v10.20 Compteur wins consécutifs
         self.last_decision={}; self.last_conf_score={}; self.last_mom_score=0
         self.fg={"value":50,"label":"Neutral"}; self.btc24={}
         self.tick_job=self.price_job=self.macro_job=self.tp_job=self.backup_job=self.recap_job=None
@@ -1501,6 +1558,16 @@ async def job_tick(context):
             if clob_bal is not None and clob_bal > 0:
                 st.bankroll = clob_bal
                 log.info(f"Balance sync après trade: {clob_bal:.2f}$")
+            # ✅ v10.20 — Mode conservateur après 3 pertes
+            if not won:
+                st.win_streak_count = 0
+                if st.consec >= CONSERVATIVE_AFTER_LOSSES:
+                    st.conservative_until = time.time() + 2*3600
+                    await send(context.bot, f"⚠️ *Mode conservateur activé 2h* — {st.consec} pertes consécutives")
+            else:
+                st.win_streak_count += 1
+                if st.win_streak_count >= BOOST_AFTER_WINS:
+                    await send(context.bot, f"🔥 *{st.win_streak_count} wins consécutifs* — Kelly légèrement augmenté")
             cd_msg=f"\n⏸ Cooldown {COOLDOWN_MIN}min" if in_cd() else ""
             await send(context.bot,f"{'✅' if won else '❌'} *Trade clôturé* [📄]\n`{bet['dir']}` `${bet['entry']:,.0f}`→`${st.price:,.0f}`\nPnL:`{'+' if gross>=0 else ''}{gross:.2f}$` BR:`{st.bankroll:.2f}` ROI:`{roi()}`{cd_msg}")
             st.backup()
@@ -1531,6 +1598,12 @@ async def job_tick(context):
         st.skipped+=1; st.pass_reasons.append({"ts":int(time.time()),"reason":f"Mom {mom_score}<{min_mom}"}); return
     if i5.get("atr_pct",0)<0.03: st.skipped+=1; return
     if i5.get("vol_ratio",1)<0.4: st.skipped+=1; return
+    # ✅ v10.20 — Filtre ADX: éviter les marchés sans tendance
+    adx_val = i5.get("adx", 20)
+    if adx_val < 15:  # Marché en range serré = éviter
+        st.skipped+=1
+        st.pass_reasons.append({"ts":int(time.time()),"reason":f"ADX trop faible ({adx_val:.0f}<15) = range"})
+        return
     tpu=0.5; tpd=0.5; market_end=0
     if not st.paper_mode:
         market=await poly.find_btc_5min_market()
