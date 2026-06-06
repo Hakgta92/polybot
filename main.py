@@ -15,7 +15,7 @@ from collections import deque
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 
-BOT_VERSION = "10.20c"
+BOT_VERSION = "10.20d"
 
 def load_env():
     env_path = os.path.join(os.path.dirname(__file__), '.env')
@@ -1169,9 +1169,9 @@ Signaux:{sigs_txt}
 {patterns} | {loss_analysis}
 {trades_txt}Consec:{consec} | BR:{bankroll:.2f}$
 RÈGLES STRICTES ET NON NÉGOCIABLES:
-✅ TRADER OBLIGATOIREMENT si: tradeable=OUI ET mom≥{min_mom} ET payout≥1.3
-❌ PASSER UNIQUEMENT si: tradeable=NON OU mom<{min_mom} OU payout<1.3
-🚫 INTERDIT de refuser pour: RSI suracheté/survendu, divergences, corrections potentielles, risques techniques
+✅ TRADER OBLIGATOIREMENT si: tradeable=OUI ET mom≥{min_mom} ET 1.3≤payout≤5.0
+❌ PASSER UNIQUEMENT si: tradeable=NON OU mom<{min_mom} OU payout<1.3 OU payout>5.0
+🚫 INTERDIT de trader si payout>5.0 (token<0.20$) = marché pense >80% que tu perds
 🚫 INTERDIT d'inventer des raisons supplémentaires
 ⚠️ mom={min_mom} exactement = VALIDE sans exception
 ⚠️ Si les 3 conditions ✅ sont remplies → trade=true OBLIGATOIRE
@@ -1675,13 +1675,19 @@ async def job_tick(context):
             except: pass
         else:
             st.skipped+=1; st.pass_reasons.append({"ts":int(time.time()),"reason":"Aucun marché actif"}); return
-    # ✅ v10.19c — Vérifier payout AVANT d'appeler Claude (économie API)
+    # ✅ v10.20d — Vérifier payout AVANT d'appeler Claude (économie API)
     ppu=round(1/tpu,2) if tpu>0 else 0
     ppd=round(1/tpd,2) if tpd>0 else 0
     best_payout = ppu if conf_score["direction"]=="UP" else ppd
     if best_payout < 1.3 and not st.paper_mode:
         st.skipped+=1
         st.pass_reasons.append({"ts":int(time.time()),"reason":f"Payout {best_payout:.2f}<1.3 (skip Claude)"})
+        return
+    # ✅ v10.20d — Payout MAX: token < 0.20$ = marché trop déséquilibré (>80% contre toi)
+    token_price_dir = tpu if conf_score["direction"]=="UP" else tpd
+    if token_price_dir < 0.20 and not st.paper_mode:
+        st.skipped+=1
+        st.pass_reasons.append({"ts":int(time.time()),"reason":f"Token trop bas ({token_price_dir:.2f}$<0.20$) = payout x{best_payout:.1f} trop risqué"})
         return
     dec=await claude_decide(i1,i5,i15,i1h,i4h,adv,st.trades[-15:],st.bankroll,st.consec,
                             st.fg,st.btc24,sess,conf_score,mom_score,tpu,tpd,st.last_ob,st.last_liq,eth_desc)
@@ -2213,6 +2219,28 @@ async def cmd_cooldown(update,context):
     st.cooldown_until=0; st.consec=0; st.daily_pause_until=0
     await update.message.reply_text("✅ Cooldown + pause reset.",parse_mode="Markdown")
 
+async def cmd_sellcheck(update,context):
+    """✅ v10.20d — Affiche le PnL actuel sans vendre"""
+    if not auth(update): return
+    if not st.bet:
+        await update.message.reply_text("❌ Aucune position active."); return
+    if not st.active_token_id:
+        await update.message.reply_text("❌ Pas de token actif."); return
+    current_price = await poly.get_token_price(st.active_token_id)
+    if current_price <= 0 or st.entry_token_price <= 0:
+        await update.message.reply_text("❌ Prix non disponible."); return
+    gain_mult = current_price / st.entry_token_price
+    gross = round((current_price - st.entry_token_price) * st.shares_bought, 2)
+    emoji = "✅" if gross >= 0 else "❌"
+    remaining = int((st.bet_expiry - time.time())) if st.bet_expiry > 0 else 0
+    await update.message.reply_text(
+        f"💰 *Position actuelle*\n━━━━━━━━━━━━━━\n"
+        f"{emoji} `{st.bet['dir']}` | x`{gain_mult:.2f}` | PnL:`{fmt(gross)}$`\n"
+        f"Token: `{st.entry_token_price:.3f}$` → `{current_price:.3f}$`\n"
+        f"⏰ Expire dans: `{remaining}s`\n\n"
+        f"Tape `/sell` pour vendre maintenant.",
+        parse_mode="Markdown")
+
 async def cmd_sell(update,context):
     """✅ v10.19d — Vente manuelle immédiate de la position active"""
     if not auth(update): return
@@ -2295,7 +2323,7 @@ def main():
         ("stats",cmd_stats),("fear",cmd_fear),("passes",cmd_passes),("market",cmd_market),
         ("balance",cmd_balance),("paper",cmd_paper),("cooldown",cmd_cooldown),("reset",cmd_reset),
         ("setbalance",cmd_setbalance),("backup",cmd_backup),("recap",cmd_recap),("dashboard",cmd_dashboard),
-        ("history",cmd_history),("turbo",cmd_turbo),("sell",cmd_sell)]:
+        ("history",cmd_history),("turbo",cmd_turbo),("sell",cmd_sell),("sellcheck",cmd_sellcheck)]:
         app.add_handler(CommandHandler(name,handler))
     app.add_handler(CallbackQueryHandler(cb))
     log.info(f"🧠 PolyBot v{BOT_VERSION} démarré")
