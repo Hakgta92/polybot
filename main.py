@@ -15,7 +15,7 @@ from collections import deque
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 
-BOT_VERSION = "10.20h"
+BOT_VERSION = "10.20i"
 
 def load_env():
     env_path = os.path.join(os.path.dirname(__file__), '.env')
@@ -1583,9 +1583,12 @@ async def job_tick(context):
     # Trop tôt (T-150s+) = direction pas encore claire, token pas cher mais trop incertain
     # T-30s à T-60s = direction BTC quasi lockée, bon ratio précision/payout
     # T-10s = trop tard pour placer l'ordre blockchain (latence 2-5s)
-    if slot_remaining < 50:  # Trop tard — moins de 50s restantes
+    # ✅ v10.20i — Fenêtre optimale basée sur latence réelle du bot
+    # Notre bot prend ~10-15s pour analyse + Claude + ordre
+    # On vise T-60s à T-150s : direction déjà claire, assez de temps pour placer
+    if slot_remaining < 60:  # Trop tard — risque que l'ordre arrive après expiration
         return
-    if slot_remaining > 120:  # Trop tôt — plus de 120s restantes, attendre
+    if slot_remaining > 150:  # Trop tôt — direction BTC pas encore claire
         return
     # Skip si tout début du slot
     if slot_pos < 15:
