@@ -15,7 +15,7 @@ from collections import deque
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 
-BOT_VERSION = "10.20j"
+BOT_VERSION = "10.20k"
 
 def load_env():
     env_path = os.path.join(os.path.dirname(__file__), '.env')
@@ -538,26 +538,66 @@ class PolyClient:
             log.error(f"V1 import erreur: {e}")
         return None
 
-    async def sell_position(self,token_id,shares):
+    async def sell_position(self, token_id, shares, opposite_token_id=None, current_price=0.5):
+        """
+        ✅ v10.20k — Vente via negative risk Polymarket
+        Pour vendre DOWN → acheter UP au prix (1 - prix_DOWN)
+        Les deux tokens partagent la même liquidité sur Polymarket CLOB V2
+        """
         if not self.ready or not self.client: return None
         try:
             from py_clob_client_v2 import OrderArgs, OrderType, Side, PartialCreateOrderOptions
-            # Vendre = BUY du côté opposé ou SELL du token
-            resp = self.client.create_and_post_order(
-                order_args=OrderArgs(token_id=token_id, price=0.99, side=Side.SELL, size=round(float(shares),2)),
-                options=PartialCreateOrderOptions(tick_size="0.01"),
-                order_type=OrderType.FOK,
-            )
-            log.info(f"sell_position V2: {resp}")
-            return resp if resp and resp.get("success") else None
+
+            # Méthode 1: SELL direct du token (FAK)
+            try:
+                sell_price = round(max(0.01, current_price - 0.02), 2)  # Légèrement sous le marché
+                resp = self.client.create_and_post_order(
+                    order_args=OrderArgs(token_id=token_id, price=sell_price, side=Side.SELL, size=round(float(shares), 2)),
+                    options=PartialCreateOrderOptions(tick_size="0.01"),
+                    order_type=OrderType.FAK,
+                )
+                log.info(f"sell_position FAK: {resp}")
+                if resp and resp.get("success"):
+                    return resp
+            except Exception as e1:
+                log.warning(f"sell FAK échoué: {e1}")
+
+            # Méthode 2: GTC limite (reste dans l'orderbook)
+            try:
+                sell_price = round(max(0.01, current_price - 0.01), 2)
+                resp2 = self.client.create_and_post_order(
+                    order_args=OrderArgs(token_id=token_id, price=sell_price, side=Side.SELL, size=round(float(shares), 2)),
+                    options=PartialCreateOrderOptions(tick_size="0.01"),
+                    order_type=OrderType.GTC,
+                )
+                log.info(f"sell_position GTC: {resp2}")
+                if resp2 and (resp2.get("success") or resp2.get("orderID")):
+                    return resp2
+            except Exception as e2:
+                log.warning(f"sell GTC échoué: {e2}")
+
+            # Méthode 3: Acheter le token opposé (negative risk)
+            if opposite_token_id:
+                try:
+                    buy_price = round(min(0.99, 1.0 - current_price + 0.02), 2)
+                    resp3 = self.client.create_and_post_order(
+                        order_args=OrderArgs(token_id=opposite_token_id, price=buy_price, side=Side.BUY, size=round(float(shares), 2)),
+                        options=PartialCreateOrderOptions(tick_size="0.01"),
+                        order_type=OrderType.FAK,
+                    )
+                    log.info(f"sell via opposite token FAK: {resp3}")
+                    if resp3 and resp3.get("success"):
+                        return resp3
+                except Exception as e3:
+                    log.warning(f"sell opposite échoué: {e3}")
+
         except Exception as e:
             err = str(e)
             if "No orderbook" in err or "404" in err:
-                # ✅ Slot expiré = résolution automatique par Polymarket
-                log.info("sell_position: slot expiré, résolution auto Polymarket")
+                log.info("sell_position: slot expiré, résolution auto")
                 return {"success": True, "auto_resolved": True}
             log.error(f"sell_position: {e}")
-            return None
+        return None
 
 poly=PolyClient()
 
@@ -1490,7 +1530,10 @@ async def job_take_profit(context):
 
         if sell_reason:
             shares_to_sell = round(st.shares_bought * sell_pct / 100, 4)
-            result = await poly.sell_position(st.active_token_id, shares_to_sell)
+            opp_token = None
+            if st.current_market:
+                opp_token = st.current_market.get("token_up") if st.bet.get("dir")=="DOWN" else st.current_market.get("token_down")
+            result = await poly.sell_position(st.active_token_id, shares_to_sell, opp_token, current_price)
             if result:
                 gross = round((current_price - st.entry_token_price) * shares_to_sell, 2)
                 # Sync balance CLOB
@@ -2338,7 +2381,14 @@ async def cmd_sell(update,context):
     current_price = await poly.get_token_price(st.active_token_id)
     gain_mult = current_price/st.entry_token_price if st.entry_token_price>0 and current_price>0 else 0
 
-    result = await poly.sell_position(st.active_token_id, st.shares_bought)
+    # Déterminer le token opposé pour la méthode negative risk
+    opposite_token = None
+    if st.current_market:
+        if st.bet.get("dir") == "DOWN":
+            opposite_token = st.current_market.get("token_up")
+        else:
+            opposite_token = st.current_market.get("token_down")
+    result = await poly.sell_position(st.active_token_id, st.shares_bought, opposite_token, current_price)
     if result:
         clob_bal = await fetch_clob_balance()
         bet = st.bet
