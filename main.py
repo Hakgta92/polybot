@@ -1643,6 +1643,18 @@ async def job_backup(context):
     st.calib_factor = factor
     st.backup()
 
+async def job_sync_balance(context):
+    """✅ v11.9 — Sync auto BR avec solde CLOB réel toutes les 30min (h24 sans intervention)"""
+    if st.paper_mode or not poly.ready or st.bet: return  # pas pendant un trade
+    try:
+        clob_bal = await fetch_clob_balance()
+        if clob_bal and clob_bal > 0 and abs(clob_bal - st.bankroll) > 0.10:
+            old_br = st.bankroll
+            st.bankroll = round(clob_bal, 2)
+            log.info(f"Sync BR: {old_br:.2f}$ → {clob_bal:.2f}$ (CLOB réel)")
+    except Exception as e:
+        log.warning(f"job_sync_balance: {e}")
+
 async def job_daily_recap(context):
     """✅ v10.16 — Résumé 22h + rapport hebdo dimanche + alerte bot arrêté"""
     h_paris=(datetime.utcnow().hour+2)%24
