@@ -61,7 +61,7 @@ from collections import deque
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 
-BOT_VERSION = "11.6"
+BOT_VERSION = "11.7"
 
 def load_env():
     env_path = os.path.join(os.path.dirname(__file__), '.env')
@@ -2629,12 +2629,12 @@ async def job_oracle_lag(context):
     # ── Signal oracle (v10.32 — 3 features documentées par les pros) ──
     now = time.time()
     if not st.oracle_connected or st.oracle_price <= 0 or st.oracle_slot_open <= 0:
-        return
+        log_skip(f"Oracle: WS non dispo (T-{int(slot_remaining)}s)", None); return
     if now - st.oracle_ts > ORACLE_MIN_FRESH_S:
-        return  # tick oracle périmé
+        log_skip(f"Oracle: tick périmé {int(now-st.oracle_ts)}s (T-{int(slot_remaining)}s)", None); return
     cur_slot = int(now // 300) * 300
     if st.oracle_slot_ts != cur_slot:
-        return  # pas de slot open oracle pour ce slot
+        log_skip(f"Oracle: pas de slot open (T-{int(slot_remaining)}s)", None); return
 
     # ── Feature 1: delta cumulé depuis slot open (signal de direction) ──
     oracle_delta = (st.oracle_price - st.oracle_slot_open) / st.oracle_slot_open * 100
@@ -3127,7 +3127,7 @@ async def cmd_run(update,context):
     context.job_queue.run_repeating(job_check_expiry,interval=30,first=15)
     context.job_queue.run_repeating(job_ws_watchdog_all,interval=30,first=1)  # ✅ v10.23 tous les WS
     context.job_queue.run_repeating(job_staged_entry,interval=5,first=14)     # ✅ v10.23 2e tranche
-    context.job_queue.run_repeating(job_oracle_lag,interval=2,first=16)       # ✅ v11.6 — 2s dans fenêtre T-35s→T-6s
+    context.job_queue.run_repeating(job_oracle_lag,interval=1,first=16)       # ✅ v11.7 — 1s précision maximale
     context.job_queue.run_repeating(job_auto_calibrate,interval=7200,first=300)  # ✅ v10.37 seuils auto
     context.job_queue.run_repeating(job_pattern_memory,interval=3600,first=600)  # ✅ v10.37 mémoire patterns
     context.job_queue.run_repeating(job_haiku_analysis,interval=7200,first=900)  # ✅ v10.37 Haiku insights
