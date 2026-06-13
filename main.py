@@ -11,6 +11,25 @@ SOURCES VÉRIFIÉES (juin 2026):
   • Filtre fee_pct>0.5% SUPPRIMÉ: redondant avec EV gate, tuait la zone 0.55-0.75$
   • Fee max crypto = 1.80% à p=0.50$ (source: startpolymarket.com)
 
+NOUVEAUTÉS v10.33 — ARCHITECTURE ORACLE CORRIGÉE (source: blockeden.xyz/forum):
+
+RÉVÉLATIONS SOURCES JUIN 2026:
+  1. Chainlink Data Streams = PULL-BASED sub-seconde (pas push 10-30s)
+     Notre flux RTDS = exactement la source de settlement. Pas de délai entre
+     oracle qu on trace et prix de résolution.
+  2. TIES résolus en UP (smart contract): "end price >= start price → UP wins"
+     → Bonus UP de +0.01 sur les slots quasi-plats (EV asymétrique)
+  3. Settlement delay = 64 blocs Polygon (~2min) APRÈS la fin du slot
+     → Pas d impact sur notre trade mais confirme que T-6s est le dernier moment
+
+IMPACT SUR LA STRATÉGIE:
+  • Le gap spot↔oracle EST immédiat (sub-sec), pas un lag de 30-55s
+  • L edge réel = spot consensus (Binance+CB+Kraken) vs oracle multi-exchange
+    Binance bouge d abord → CB/Kraken suivent → oracle aggregate suit
+    Pendant cette cascade de 1-5s, le gap est exploitable
+  • Seuil gap abaissé: 0.02% → 0.01% (le lag est plus court, seuil doit être fin)
+  • cmd_oracle mis à jour: affiche signal réel + recommandation trade
+
 NOUVEAUTÉS v10.28 — R:R FIX (diagnostic sur 20 trades réels):
 
 PROBLÈME IDENTIFIÉ sur v10.27:
@@ -42,7 +61,7 @@ from collections import deque
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 
-BOT_VERSION = "10.32"
+BOT_VERSION = "10.33"
 
 def load_env():
     env_path = os.path.join(os.path.dirname(__file__), '.env')
@@ -2586,7 +2605,7 @@ async def job_oracle_lag(context):
     gap_direction = None
     if spot_now > 0 and st.oracle_price > 0:
         spot_oracle_gap = (spot_now - st.oracle_price) / st.oracle_price * 100
-        if abs(spot_oracle_gap) >= 0.02:   # 2bps gap minimum = lag détecté
+        if abs(spot_oracle_gap) >= 0.01:   # ✅ v10.33 — 1bps (Data Streams sub-sec: le lag est bref)
             gap_direction = "UP" if spot_oracle_gap > 0 else "DOWN"
 
     # ── Feature 3: returns 1s/3s/10s BTC (momentum court terme) ──
@@ -2666,14 +2685,19 @@ async def job_oracle_lag(context):
     # Calibration empirique: à T-20s Δ0.05%, les pros observent ~85-90% WR
     # On reste conservateur: P = 0.85 (pas de modèle Brownien ici)
     # ── p_oracle calibré selon la force et le type de signal ──
-    # Gap instantané spot↔oracle = signal plus fort (marché va bouger dans <30s)
-    # Delta cumulé = signal de tendance (plus flou, plus ancien)
+    # Gap instantané spot↔oracle = signal plus fort (Binance bouge avant aggregate)
+    # Delta cumulé = signal de tendance
     if primary_signal == "gap":
         p_oracle = min(0.93, 0.85 + abs(spot_oracle_gap) * 3.0)
     else:
         p_oracle = min(0.90, 0.80 + abs(oracle_delta) * 2.0)
     # Bonus si 3/3 signals alignés
     if dir_votes >= 3: p_oracle = min(0.95, p_oracle + 0.03)
+    # ✅ v10.33 — Tie bias: smart contract → "end price >= start price → UP wins"
+    # Sur les slots quasi-plats (delta <0.01%), UP a un avantage asymétrique
+    # Source: blockeden.xyz/forum (ethereum_emma, confirmation smart contract)
+    if direction == "UP" and abs(oracle_delta) < 0.01:
+        p_oracle = min(0.95, p_oracle + 0.01)  # +1pt sur UP quasi-plat
     ev = p_oracle - token_price - fee
 
     if ev < ORACLE_EDGE_MIN:
@@ -3432,26 +3456,51 @@ async def cmd_backtest(update,context):
     await update.message.reply_text(res, parse_mode="Markdown")
 
 async def cmd_oracle(update,context):
-    """✅ v10.23 — État du feed Chainlink + lag oracle vs orderbook"""
+    """✅ v10.33 — Oracle complet: gap spot↔oracle + signal réel + recommandation trade"""
     if not auth(update): return
-    sig=compute_oracle_lag()
-    age=int(time.time()-st.oracle_ts) if st.oracle_ts else 999
-    cons=consensus_price()
-    div_spot=""
-    if st.oracle_price>0 and cons>0:
-        d=(cons-st.oracle_price)/st.oracle_price*100
-        div_spot=f"\nSpot consensus:`${cons:,.2f}` (Δ oracle:`{d:+.3f}%`)"
-    sig_txt=sig["desc"] if sig else "Pas de lag exploitable maintenant"
+    now = time.time()
+    oracle = st.oracle_price; slot_open = st.oracle_slot_open
+    spot = consensus_price()
+    oracle_delta = (oracle - slot_open) / slot_open * 100 if slot_open > 0 else 0
+    spot_gap = (spot - oracle) / oracle * 100 if oracle > 0 else 0
+    tick_age = int(now - st.oracle_ts) if st.oracle_ts > 0 else 999
+    slot_remaining = 300 - (now % 300)
+    in_window = ORACLE_WINDOW_END <= slot_remaining <= ORACLE_WINDOW_START
+    # Sources actives
+    srcs = []
+    if st.ws_price > 0: srcs.append(f"Binance✅")
+    if hasattr(st,'cb_price') and st.cb_price > 0 and now - st.cb_ts < EXCH_STALE_S: srcs.append("Coinbase✅")
+    else: srcs.append("Coinbase❌")
+    if hasattr(st,'kr_price') and st.kr_price > 0 and now - st.kr_ts < EXCH_STALE_S: srcs.append("Kraken✅")
+    else: srcs.append("Kraken❌")
+    # Signal dominant (même logique que job_oracle_lag)
+    gap_dir = ("UP" if spot_gap>0 else "DOWN") if abs(spot_gap) >= 0.01 else None
+    delta_dir = ("UP" if oracle_delta>0 else "DOWN") if abs(oracle_delta) >= ORACLE_ENTRY_DELTA else None
+    sig_dir = gap_dir or delta_dir
+    sig_type = ("gap spot↔oracle" if gap_dir else "delta slot open") if sig_dir else None
+    sig_val = spot_gap if gap_dir else oracle_delta
+    # Recommandation
+    if sig_dir:
+        if in_window and st.oracle_connected and tick_age <= ORACLE_MIN_FRESH_S:
+            rec = f"⚡ BOT TRADAIT *{sig_dir}* maintenant (T-`{int(slot_remaining)}s`)"
+        elif in_window:
+            rec = f"⚠️ Signal *{sig_dir}* mais oracle périmé (`{tick_age}s`)"
+        else:
+            rec = f"⏳ Signal *{sig_dir}* ({sig_type} `{sig_val:+.3f}%`) — hors fenêtre (T-`{int(slot_remaining)}s`)"
+    else:
+        rec = f"📡 Pas de lag exploitable (gap:`{spot_gap:+.3f}%` delta:`{oracle_delta:+.3f}%`)"
+    # Tie bias
+    tie_note = "\n💡 _Quasi-plat → tie bias UP (smart contract: end≥start=UP gagne)_" if abs(oracle_delta)<0.01 and abs(spot_gap)<0.01 else ""
     await update.message.reply_text(
         f"🔗 *ORACLE CHAINLINK*\n━━━━━━━━━━━━━━\n"
-        f"Connecté:{'✅' if st.oracle_connected else '❌'} | Tick:`{age}s`\n"
-        f"Oracle BTC:`${st.oracle_price:,.2f}`\n"
-        f"Slot open:`${st.oracle_slot_open:,.2f}`{div_spot}\n\n"
-        f"📡 {sig_txt}\n\n"
-        f"WS: Binance{'✅' if st.ws_connected else '❌'} "
-        f"Coinbase{'✅' if (time.time()-st.cb_ts<5) else '❌'} "
-        f"Kraken{'✅' if (time.time()-st.kr_ts<5) else '❌'}",
+        f"Connecté:{'✅' if st.oracle_connected else '❌'} | Tick:`{tick_age}s`\n"
+        f"Oracle BTC:`${oracle:,.2f}`\n"
+        f"Slot open:`${slot_open:,.2f}` (Δ oracle:`{oracle_delta:+.3f}%`)\n"
+        f"Spot consensus:`${spot:,.2f}` (Δ oracle:`{spot_gap:+.3f}%`){tie_note}\n\n"
+        f"{rec}\n\n"
+        f"WS: {' | '.join(srcs)}",
         parse_mode="Markdown")
+
 
 async def cmd_calib(update,context):
     """✅ v10.23 — État de la calibration sigma"""
