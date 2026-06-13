@@ -3002,7 +3002,11 @@ async def cmd_learn(update, context):
             lines.append(f"\n🤖 *Dernier insight Haiku:*")
             lines.append(last_h[-1]["insight"][:300])
 
-    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+    try:
+        await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+    except Exception:
+        clean=[l.replace("*","").replace("`","").replace("_","") for l in lines]
+        await update.message.reply_text("\n".join(clean))
 
 
 def auth(u): return ALLOWED_UID==0 or u.effective_user.id==ALLOWED_UID
@@ -3404,7 +3408,12 @@ async def cmd_trades(update,context):
         elapsed=int((time.time()-st.bet["ts"])/60)
         trail=" 🎯TRAIL" if st.trailing_active else ""
         lines.append(f"\n🔄 *Actif:* `{st.bet['dir']}` `{st.bet['amount']:.2f}$` ({elapsed}min){trail}")
-    await update.message.reply_text("\n".join(lines),parse_mode="Markdown")
+    try:
+        await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+    except Exception:
+        # Fallback sans Markdown si caractères spéciaux dans les raisons
+        clean = [l.replace("*","").replace("`","").replace("_","") for l in lines]
+        await update.message.reply_text("\n".join(clean))
 
 async def cmd_history(update,context):
     """✅ v10.17 — 20 derniers trades avec détails complets"""
