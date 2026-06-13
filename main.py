@@ -61,7 +61,7 @@ from collections import deque
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 
-BOT_VERSION = "11.1"
+BOT_VERSION = "11.2"
 
 def load_env():
     env_path = os.path.join(os.path.dirname(__file__), '.env')
@@ -2659,21 +2659,34 @@ async def job_oracle_lag(context):
             return (spot_now - old[-1]) / old[-1] * 100 if old and old[-1]>0 else 0.0
         ret_1s = ret_over(1); ret_3s = ret_over(3); ret_10s = ret_over(10)
 
-    # ── Décision direction: combinaison des 3 features ──
-    # Priorité 1: gap spot↔oracle (plus immédiat)
-    # Priorité 2: delta cumulé depuis slot open
-    # Priorité 3: momentum returns
-    if gap_direction:
-        # Le lag instantané est le signal le plus fort
+    # ── Décision direction v11.1: combinaison intelligente gap + delta ──
+    # Si gap ET delta se contredisent fortement → le delta (tendance slot) l'emporte
+    # Données empiriques: gap faible (<0.05%) + delta fort (>0.03%) contre → suivre delta
+    # Cas 19:19: gap+0.03% UP + delta-0.04% DOWN → le bot UP → bloqué → aurait dû être DOWN
+    gap_strong = abs(spot_oracle_gap) >= FILTER_GAP_STRONG    # 0.05%
+    delta_strong = abs(oracle_delta) >= ORACLE_ENTRY_DELTA     # 0.03%
+    gap_vs_delta_conflict = (
+        gap_direction is not None and delta_strong and
+        gap_direction != ("UP" if oracle_delta > 0 else "DOWN")
+    )
+
+    if gap_strong and not gap_vs_delta_conflict:
+        # Gap fort ET pas de conflit → gap prime (lag oracle clair)
         direction = gap_direction
         primary_signal = "gap"
         signal_strength = abs(spot_oracle_gap)
-    elif abs(oracle_delta) >= ORACLE_ENTRY_DELTA:
+    elif delta_strong and (not gap_direction or gap_vs_delta_conflict):
+        # Delta fort ET gap faible ou en conflit → suivre delta (tendance slot)
         direction = "UP" if oracle_delta > 0 else "DOWN"
         primary_signal = "delta"
         signal_strength = abs(oracle_delta)
+    elif gap_direction and not gap_vs_delta_conflict:
+        # Gap faible mais pas de conflit → gap modéré accepté
+        direction = gap_direction
+        primary_signal = "gap"
+        signal_strength = abs(spot_oracle_gap)
     else:
-        log_skip(f"Oracle: Δ{oracle_delta:+.3f}% gap{spot_oracle_gap:+.3f}% (signals faibles)", None)
+        log_skip(f"Oracle: Δ{oracle_delta:+.3f}% gap{spot_oracle_gap:+.3f}% (signals faibles ou conflit)", None)
         return
 
     # ── Cohérence des 3 signals (v10.36 — filtres renforcés) ──
