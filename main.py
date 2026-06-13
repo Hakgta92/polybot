@@ -61,7 +61,7 @@ from collections import deque
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 
-BOT_VERSION = "11.4"
+BOT_VERSION = "11.5"
 
 def load_env():
     env_path = os.path.join(os.path.dirname(__file__), '.env')
@@ -2614,17 +2614,21 @@ async def job_oracle_lag(context):
     now_ts = time.time()
     slot_remaining = 300 - (now_ts % 300)
 
-    # ✅ v11.4 — Log monitoring hors fenêtre pour visibilité dans /passes
+    # ✅ v11.5 — Log systématique toutes les 5s (hors fenêtre)
+    # Reproduit le comportement original: toutes les entrées visibles dans /passes
     if not (ORACLE_WINDOW_END <= slot_remaining <= ORACLE_WINDOW_START):
         if st.oracle_connected and st.oracle_price > 0 and st.oracle_slot_open > 0:
             spot_chk = consensus_price()
             d_chk = (st.oracle_price - st.oracle_slot_open) / st.oracle_slot_open * 100 if st.oracle_slot_open > 0 else 0
             g_chk = (spot_chk - st.oracle_price) / st.oracle_price * 100 if st.oracle_price > 0 else 0
             st.gap_history.append((time.time(), g_chk))
+            # Log TOUJOURS pour visibilité complète dans /passes
             if abs(d_chk) >= ORACLE_ENTRY_DELTA or abs(g_chk) >= ORACLE_GAP_MIN:
-                dir_chk = "UP" if (g_chk > 0 and d_chk >= 0) or d_chk > 0 else "DOWN"
+                # Signal suffisant: on loggue avec direction pour le WR théorique
+                dir_chk = "UP" if (g_chk >= 0 and d_chk >= 0) else ("DOWN" if (g_chk <= 0 and d_chk <= 0) else ("UP" if d_chk >= 0 else "DOWN"))
                 log_skip(f"Oracle lag: Δ{d_chk:+.3f}% gap{g_chk:+.3f}% (hors fenêtre T-{int(slot_remaining)}s)", dir_chk)
-            elif abs(d_chk) > 0.005 or abs(g_chk) > 0.005:
+            else:
+                # Signal faible: logue sans direction (comme "— Oracle lag: Δ-0.015%<0.05%")
                 log_skip(f"Oracle lag: Δ{d_chk:+.3f}%<{ORACLE_ENTRY_DELTA}% (signal trop faible)", None)
         return
 
