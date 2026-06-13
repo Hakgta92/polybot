@@ -61,7 +61,7 @@ from collections import deque
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 
-BOT_VERSION = "10.37"
+BOT_VERSION = "11.0"
 
 def load_env():
     env_path = os.path.join(os.path.dirname(__file__), '.env')
@@ -3074,7 +3074,7 @@ async def cmd_run(update,context):
     ob_txt=st.last_ob["desc"] if st.last_ob else "N/A"
     liq_txt=st.last_liq["desc"] if st.last_liq else "N/A"
     await update.message.reply_text(
-        f"▶️ *Bot v{BOT_VERSION} démarré !*\nMode:*{'📄 PAPER' if st.paper_mode else '💰 RÉEL'}*\n"
+        f"🚀 *Bot v{BOT_VERSION} démarré !*\nMode:*{'📄 PAPER' if st.paper_mode else '💰 RÉEL'}*\n"
         f"Session:`{sess['session']}` | Seuils: score≥`{min_score}` mom≥`{min_mom}`\n"
         f"⚡ ORACLE LAG actif: T-35s→T-6s | gap≥1bps / delta≥{int(ORACLE_ENTRY_DELTA*10000)}bps\n"
         f"BR:`{st.bankroll:.2f}$` | ROI:`{roi()}`\n"
@@ -3210,7 +3210,8 @@ async def cmd_status(update,context):
         f"🎯 {score_info}{fair_info}\n\n"
         f"💰 BR:`{st.bankroll:.2f}$` | ROI:`{roi()}` | PnL:`{fmt(st.pnl)}`\n"
         f"📅 Perte jour:`{dl:.1f}%/{DAILY_LOSS_MAX*100:.0f}%`{pause_info}\n"
-        f"🎲 Bet:`{bet_info}` | 🚫 Refusés:`{st.skipped}` | ⏱`{upt()}`",
+        f"🎲 Bet:`{bet_info}` | 🚫 Refusés:`{st.skipped}` | ⏱`{upt()}`\n"
+        f"🧠 Patterns: `{len([p for p in st.oracle_patterns if p.get('result')])}` résolus | `/learn` pour détails",
         parse_mode="Markdown")
 
 async def cmd_balance(update,context):
@@ -3514,7 +3515,13 @@ async def cmd_passes(update,context):
         elif twr>=58: lines.append("_⚠️ >58% mais peu de données — continue._")
         elif twr<=52: lines.append("_✅ ~50% — les filtres ne coûtent rien, le marché était plat_")
         else: lines.append("_➖ Zone grise — encore besoin de données_")
-    await update.message.reply_text("\n".join(lines),parse_mode="Markdown")
+    try:
+        await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+    except Exception as e:
+        log.warning(f"cmd_passes markdown: {e}")
+        plain = "\n".join(lines).replace("*","").replace("`","").replace("_","")
+        try: await update.message.reply_text(plain)
+        except: pass
 
 async def cmd_fear(update,context):
     if not auth(update): return
