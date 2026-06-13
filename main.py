@@ -61,7 +61,7 @@ from collections import deque
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 
-BOT_VERSION = "11.5"
+BOT_VERSION = "11.6"
 
 def load_env():
     env_path = os.path.join(os.path.dirname(__file__), '.env')
@@ -2614,22 +2614,12 @@ async def job_oracle_lag(context):
     now_ts = time.time()
     slot_remaining = 300 - (now_ts % 300)
 
-    # ✅ v11.5 — Log systématique toutes les 5s (hors fenêtre)
-    # Reproduit le comportement original: toutes les entrées visibles dans /passes
+    # ✅ v11.6 — Hors fenêtre: juste alimenter gap_history, rien logguer
     if not (ORACLE_WINDOW_END <= slot_remaining <= ORACLE_WINDOW_START):
-        if st.oracle_connected and st.oracle_price > 0 and st.oracle_slot_open > 0:
+        if st.oracle_connected and st.oracle_price > 0:
             spot_chk = consensus_price()
-            d_chk = (st.oracle_price - st.oracle_slot_open) / st.oracle_slot_open * 100 if st.oracle_slot_open > 0 else 0
             g_chk = (spot_chk - st.oracle_price) / st.oracle_price * 100 if st.oracle_price > 0 else 0
             st.gap_history.append((time.time(), g_chk))
-            # Log TOUJOURS pour visibilité complète dans /passes
-            if abs(d_chk) >= ORACLE_ENTRY_DELTA or abs(g_chk) >= ORACLE_GAP_MIN:
-                # Signal suffisant: on loggue avec direction pour le WR théorique
-                dir_chk = "UP" if (g_chk >= 0 and d_chk >= 0) else ("DOWN" if (g_chk <= 0 and d_chk <= 0) else ("UP" if d_chk >= 0 else "DOWN"))
-                log_skip(f"Oracle lag: Δ{d_chk:+.3f}% gap{g_chk:+.3f}% (hors fenêtre T-{int(slot_remaining)}s)", dir_chk)
-            else:
-                # Signal faible: logue sans direction (comme "— Oracle lag: Δ-0.015%<0.05%")
-                log_skip(f"Oracle lag: Δ{d_chk:+.3f}%<{ORACLE_ENTRY_DELTA}% (signal trop faible)", None)
         return
 
     if st.last_trade_slot == int(now_ts // 300) * 300: return  # dédup
@@ -3137,7 +3127,7 @@ async def cmd_run(update,context):
     context.job_queue.run_repeating(job_check_expiry,interval=30,first=15)
     context.job_queue.run_repeating(job_ws_watchdog_all,interval=30,first=1)  # ✅ v10.23 tous les WS
     context.job_queue.run_repeating(job_staged_entry,interval=5,first=14)     # ✅ v10.23 2e tranche
-    context.job_queue.run_repeating(job_oracle_lag,interval=5,first=16)       # ✅ v10.30 oracle lag (T-35s→T-6s)
+    context.job_queue.run_repeating(job_oracle_lag,interval=2,first=16)       # ✅ v11.6 — 2s dans fenêtre T-35s→T-6s
     context.job_queue.run_repeating(job_auto_calibrate,interval=7200,first=300)  # ✅ v10.37 seuils auto
     context.job_queue.run_repeating(job_pattern_memory,interval=3600,first=600)  # ✅ v10.37 mémoire patterns
     context.job_queue.run_repeating(job_haiku_analysis,interval=7200,first=900)  # ✅ v10.37 Haiku insights
