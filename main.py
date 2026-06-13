@@ -1,16 +1,16 @@
 """
-POLYMARKET BTC BOT v10.25 — SNIPE-ONLY MODE
-NOUVEAUTÉS v10.25 (stratégie maker confirmée par recherches 2026):
-  • STRATÉGIE UNIQUE: SNIPE-ONLY sur token ≥ 0.82$ (frais ~0¢, direction ~90% lockée)
-  • job_tick DÉSACTIVÉ en mode réel (tokens 0.50-0.75$ = frais taker max = perte garantie)
-  • SNIPE_TOKEN_MIN relevé 0.70→0.82$ (seule zone profitable après frais 2026)
-  • SNIPE_MIN_PROB abaissé 0.82→0.78 (plus d'opportunités dans la zone sûre)
-  • SNIPE_EDGE_MIN relevé 0.03→0.05 (5% d'EV minimum après frais)
-  • Fenêtre snipe élargie: T-50s→T-15s (plus de temps pour capter les bons setups)
-  • MAX_TRADES_PER_H réduit à 1 (qualité > quantité — 1 bon trade vaut 10 mauvais)
-  • MAKER_UNDERCUT relevé 0.01→0.02 (meilleure chance d'être maker = zéro frais)
-  • Kelly min 2$ max 5$ en réel (BR ~30$ = max 16% par trade)
-  • Sources: exmon.pro, htx.com, dev.to/xniiinx (consensus 2026 sur maker strategy)
+POLYMARKET BTC BOT v10.26 — ADAPTIVE KELLY
+NOUVEAUTÉS v10.26:
+  • Kelly adaptatif par qualité de setup (3 tiers: NORMAL / FORT / EXCEPTIONNEL)
+    - NORMAL  (EV 5-10%, P 78-85%): 5% BR   → ~1.75$ sur BR 35$
+    - FORT    (EV 10-15%, P 85-92%): 10% BR  → ~3.50$ sur BR 35$
+    - EXCEPTIONNEL (EV>15%, P>92%): 15% BR  → ~5.25$ sur BR 35$
+  • Limite 1 trade/heure supprimée — bot trade quand c'est rentable
+  • Garde-fou: max 3 trades/heure (évite le surtrading)
+  • Garde-fou: pas 2 trades consécutifs sur le même slot
+  • SNIPE-ONLY en réel maintenu (token ≥ 0.82$, frais ~0¢)
+  • Stop loss maintenu à 45% du prix d'entrée
+  • Sources: managebankroll.com, agentbets.ai, medium backtest 1000 fenêtres
 """
 
 import asyncio, math, logging, os, json, time, aiohttp
@@ -19,7 +19,7 @@ from collections import deque
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 
-BOT_VERSION = "10.25"
+BOT_VERSION = "10.26"
 
 def load_env():
     env_path = os.path.join(os.path.dirname(__file__), '.env')
@@ -46,10 +46,10 @@ POLY_HOST          = "https://clob.polymarket.com"
 POLY_GAMMA         = "https://gamma-api.polymarket.com"
 POLY_CHAIN_ID      = 137
 
-MIN_BET_USD     = 2.0   # ✅ v10.25 — Min absolu 2$
-FAIR_EDGE_MIN   = 0.08  # EV minimum mode normal (non utilisé en réel v10.25)
-MAX_BET_USD     = 5.0   # ✅ v10.25 — Max 5$ (BR ~30$ = max 16% par trade)
-MAX_BET_PCT     = 0.06  # ✅ v10.25 — Max 6% de la bankroll par trade
+MIN_BET_USD     = 2.0   # Minimum absolu
+FAIR_EDGE_MIN   = 0.08
+MAX_BET_USD     = 8.0   # ✅ v10.26 — Max 8$ (setup exceptionnel sur BR 35$ = ~23%)
+MAX_BET_PCT     = 0.15  # ✅ v10.26 — Max Kelly 15% sur setup exceptionnel
 KELLY_FRACTION  = 0.25
 
 # ✅ v10.25 — Fenêtre snipe élargie + token min relevé (stratégie maker 2026)
@@ -87,12 +87,12 @@ TRAILING_STOP_MULT  = 1.3
 TAKE_PROFIT_CHECK   = 15   # ✅ v10.22 — 15s (avant: 30s, trop lent sur du 5min)
 POLY_FEE            = 0.02 # Legacy: estimation flat pour le paper mode uniquement
 MAX_CONSEC_LOSS     = 2
-COOLDOWN_MIN        = 30   # ✅ v10.25 — Cooldown étendu 25→30min
-MAX_TRADES_PER_H    = 1    # ✅ v10.25 — MAX 1 trade/heure (qualité > quantité)
-CONSERVATIVE_AFTER_LOSSES = 2   # ✅ v10.25 — Mode conservateur après 2 pertes (avant: 3)
-BOOST_AFTER_WINS    = 999       # Désactivé
+COOLDOWN_MIN        = 30
+MAX_TRADES_PER_H    = 3    # ✅ v10.26 — Max 3/heure (supprimé la limite 1, garde-fou à 3)
+CONSERVATIVE_AFTER_LOSSES = 2
+BOOST_AFTER_WINS    = 999
 DAILY_LOSS_MAX      = 0.10
-DAILY_PAUSE_H       = 3    # ✅ v10.25 — Pause 3h après daily loss (avant: 2h)
+DAILY_PAUSE_H       = 3
 
 # ✅ v10.21 — Seuils relevés (+2 partout): -73% de trades = 7x moins de pertes (source v3 testée réel)
 SESSION_THRESHOLDS = {
@@ -141,30 +141,51 @@ def delta_to_weight(pct):
 
 def kelly_bet(bankroll, win_prob, payout_mult, token_price=0.5, ev_bonus=False):
     """
-    ✅ v10.24 — Kelly corrigé:
-    - Retourne 0 si edge négatif (plus de MIN_BET forcé sur edge nul)
-    - MIN_BET dynamique: max(2$, BR*4%) — s'adapte à la bankroll
-    - Mise boostée si ev_bonus (oracle confirmé ou EV>15%): Kelly plein sans *0.25
-    - Liquidity factor maintenu pour tokens extrêmes
+    ✅ v10.26 — Kelly adaptatif 3 tiers selon qualité du setup:
+
+    TIER 1 — NORMAL      (EV 5-10%,  P 78-85%): fraction 0.25 → ~5%  BR
+    TIER 2 — FORT        (EV 10-15%, P 85-92%): fraction 0.40 → ~10% BR
+    TIER 3 — EXCEPTIONNEL(EV >15%,   P >92%):   fraction 0.55 → ~15% BR
+
+    ev_bonus=True = setup fort ou exceptionnel (oracle confirmé ou EV>15%)
+    Jamais retourner MIN_BET si edge nul — retourner 0
     """
-    # ✅ v10.24 FIX CRITIQUE: win_prob<=0 ou payout<=1 = edge nul → NE PAS TRADER
     if win_prob <= 0 or payout_mult <= 1:
         return 0.0
     b = payout_mult - 1
     q = 1 - win_prob
     kp = (win_prob * b - q) / b
     if kp <= 0:
-        return 0.0  # ✅ v10.24 FIX: edge négatif → 0, jamais MIN_BET forcé
-    # Ajustement selon liquidité du marché
+        return 0.0  # Edge négatif → ne pas trader
+
+    # Liquidity factor: réduire sur tokens extrêmes
     liquidity_factor = 1.0
-    if token_price < 0.15 or token_price > 0.85:
-        liquidity_factor = 0.7
-    # ✅ v10.24 — Mise boostée sur bon setup (oracle confirmé ou EV>15%)
-    fraction = KELLY_FRACTION * 1.5 if ev_bonus else KELLY_FRACTION
-    raw_bet = bankroll * min(kp * fraction * liquidity_factor, MAX_BET_PCT)
-    # ✅ v10.24 — MIN_BET dynamique: max(2$, 4% de la bankroll)
+    if token_price < 0.15 or token_price > 0.92:
+        liquidity_factor = 0.8
+
+    # ✅ v10.26 — 3 tiers selon EV réelle
+    ev_real = win_prob - token_price  # EV approximative
+    if ev_real >= 0.15 or win_prob >= 0.92:
+        # TIER 3 — EXCEPTIONNEL: 15% BR max
+        fraction = 0.55
+        tier_pct = 0.15
+        tier_name = "EXCEPTIONNEL"
+    elif ev_real >= 0.10 or win_prob >= 0.85:
+        # TIER 2 — FORT: 10% BR max
+        fraction = 0.40
+        tier_pct = 0.10
+        tier_name = "FORT"
+    else:
+        # TIER 1 — NORMAL: 5% BR max
+        fraction = 0.25
+        tier_pct = 0.05
+        tier_name = "NORMAL"
+
+    raw_bet = bankroll * min(kp * fraction * liquidity_factor, tier_pct)
     dynamic_min = max(MIN_BET_USD, round(bankroll * 0.04, 2))
-    return round(max(dynamic_min, min(raw_bet, MAX_BET_USD)), 2)
+    result = round(max(dynamic_min, min(raw_bet, MAX_BET_USD)), 2)
+    log.debug(f"Kelly tier={tier_name} EV={ev_real:.2f} P={win_prob:.2f} → {result:.2f}$")
+    return result
 
 # ─── DONNÉES AVANCÉES ──────────────────────────────────────────────────────
 async def fetch_orderbook_imbalance():
@@ -2391,15 +2412,20 @@ async def job_snipe(context):
     if ev < SNIPE_EDGE_MIN:
         log_skip(f"SNIPE: EV {ev*100:+.1f}%<{SNIPE_EDGE_MIN*100:.0f}% (P:{p_dir:.2f} tok:{token_price_dir:.2f}$)", direction)
         return
-    # ✅ v10.25 — ev_bonus: tout snipe dans la zone sûre est déjà un bon setup
-    ev_bonus_snipe = ev >= 0.05
+    # ✅ v10.26 — Tier du setup pour le message
+    if ev >= 0.15 or p_dir >= 0.92:
+        tier_label = "🔥 EXCEPTIONNEL (~15% BR)"
+    elif ev >= 0.10 or p_dir >= 0.85:
+        tier_label = "⚡ FORT (~10% BR)"
+    else:
+        tier_label = "✅ NORMAL (~5% BR)"
     payout=round(1/token_price_dir,2) if token_price_dir>0 else 1.1
-    amount=kelly_bet(st.bankroll, p_dir, payout, token_price_dir, ev_bonus=ev_bonus_snipe)
+    amount=kelly_bet(st.bankroll, p_dir, payout, token_price_dir)
     if st.win_streak_count >= BOOST_AFTER_WINS:
         amount=round(min(amount*1.2, MAX_BET_USD),2)
     if amount<MIN_BET_USD or st.bankroll<amount: return
     conf_score=st.last_conf_score if st.last_conf_score else {"score":0,"signals":[]}
-    reasoning=f"SNIPE T-{int(slot_remaining)}s | P({direction})={p_dir:.2f} vs token {token_price_dir:.2f}$ | EV {ev*100:+.1f}% | Δ{delta_pct:+.3f}%"
+    reasoning=f"SNIPE {tier_label} T-{int(slot_remaining)}s | P({direction})={p_dir:.2f} vs token {token_price_dir:.2f}$ | EV {ev*100:+.1f}% | Δ{delta_pct:+.3f}%"
     ok=await place_bet(context, direction, amount, round(p_dir,2), reasoning, conf_score, sess, tpu, tpd, market_end, source="snipe")
     if not ok: return
     st.last_decision={"dir":direction,"conf":round(p_dir,2),"size":amount,"reasoning":reasoning,
@@ -2408,9 +2434,10 @@ async def job_snipe(context):
     entry_tp=st.entry_token_price if not st.paper_mode else token_price_dir
     await send(context.bot,
         f"🎯 *SNIPE placé* [{mode}]\n━━━━━━━━━━━━━━━\n"
-        f"*{direction}* | `{amount:.2f}$` | P:`{p_dir*100:.0f}%` | ⏰T-`{int(slot_remaining)}s`\n"
-        f"Token:`{entry_tp:.3f}$` | EV:`{ev*100:+.1f}%` | Frais:`{fee*100:.2f}¢`\n"
-        f"₿`${st.ws_price:,.2f}` Δslot:`{delta_pct:+.3f}%` σ:`{sigma:.4f}`\n\n"
+        f"*{direction}* | `{amount:.2f}$` ({round(amount/st.bankroll*100,1) if st.bankroll>0 else 0:.1f}% BR) | {tier_label}\n"
+        f"P:`{p_dir*100:.0f}%` | ⏰T-`{int(slot_remaining)}s` | EV:`{ev*100:+.1f}%`\n"
+        f"Token:`{entry_tp:.3f}$` | Frais:`{fee*100:.2f}¢` | σ:`{sigma:.4f}`\n"
+        f"₿`${st.ws_price:,.2f}` Δslot:`{delta_pct:+.3f}%`\n\n"
         f"💭 _{reasoning}_")
 
 def auth(u): return ALLOWED_UID==0 or u.effective_user.id==ALLOWED_UID
@@ -2428,19 +2455,17 @@ async def cmd_start(update,context):
     if not auth(update): return
     w=POLY_FUNDER_WALLET or POLY_PROXY_WALLET or "?"
     await update.message.reply_text(
-        f"🧠 *POLYMARKET BOT v{BOT_VERSION} — SNIPE ONLY*\n━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"🧠 *POLYMARKET BOT v{BOT_VERSION} — ADAPTIVE KELLY*\n━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"Mode:*{'📄 PAPER' if st.paper_mode else '💰 RÉEL'}* | API:{'✅' if poly.ready else '❌'}\n"
         f"Wallet:`{w[:6]}...{w[-4:]}`\n\n"
-        f"🆕 v10.25 — Stratégie maker 2026:\n"
-        f"  🎯 SNIPE-ONLY en réel (token ≥0.82$, frais ~0¢)\n"
-        f"  🚫 job\\_tick désactivé en réel (0.50-0.75$ = frais max)\n"
-        f"  ✅ MAX 1 trade/heure | MAX 5$/trade\n"
-        f"  ✅ EV min 5% | Token 0.82-0.96$ uniquement\n"
-        f"  ✅ Fenêtre T-50s→T-15s\n"
-        f"  ✅ Maker orders = zéro frais + rebate 25%\n\n"
+        f"🆕 v10.26 — Kelly adaptatif 3 tiers:\n"
+        f"  ✅ NORMAL  (EV 5-10%):  ~5% BR  (~{st.bankroll*0.05:.2f}$)\n"
+        f"  ⚡ FORT    (EV 10-15%): ~10% BR (~{st.bankroll*0.10:.2f}$)\n"
+        f"  🔥 EXCEP   (EV >15%):   ~15% BR (~{st.bankroll*0.15:.2f}$)\n"
+        f"  🎯 SNIPE-ONLY réel | token ≥0.82$ | Max 3/heure\n\n"
         f"*/run* */stop* */status* */signal* */score*\n"
         f"*/market* */balance* */trades* */recap* */dashboard*\n"
-        f"*/passes* */fair* */setbalance 30.43* • */backup*",
+        f"*/passes* */fair* */setbalance {st.bankroll:.2f}* • */backup*",
         parse_mode="Markdown")
 
 async def cmd_run(update,context):
