@@ -144,7 +144,7 @@ ORACLE_ULTRA_EV_MIN = 0.05  # EV min pour passe ultra (moins strict car WR > 95%
 
 # ✅ v10.36 — Filtres WR validés par étude live (medium.com/@gwrx2005, mars 2026)
 # Source: filtre 10min → -93% pertes, seuils relevés → -73% fréquence = bien meilleur WR
-ORACLE_DELTA_CONTRA_MAX = 0.02  # ✅ v11.9f — calibré sur données réelles  # Si votes=1/3, delta contre doit être < 0.03% sinon skip
+ORACLE_DELTA_CONTRA_MAX = 0.032 # ✅ v11.9g Haiku — WIN tous delta≥+0.031% LOSS tous delta≤-0.001%  # Si votes=1/3, delta contre doit être < 0.03% sinon skip
 ORACLE_GAP_MIN_STRONG   = 0.05  # Gap "fort" = au-delà de ce seuil, même votes=1/3 accepté
 ORACLE_TREND_10MIN      = 0.08  # Filtre tendance 10min: si BTC contre-tendance de 0.08%, skip
 ORACLE_GAP_CONFIRM_RET  = 0.01  # Return 3s minimum pour confirmer la direction du gap (0.01%=1bps)
@@ -2681,16 +2681,14 @@ async def job_oracle_lag(context):
         1 if direction=="UP" and ret_3s>0 else (-1 if direction=="DOWN" and ret_3s<0 else 0),
     ])
 
-    # ✅ v10.36 FIX #1 — Votes=1/3 uniquement si gap fort OU delta neutre
-    # Source: trade perdu (delta -0.053%, gap +0.037%, votes 1/3)
-    # → gap seul ne suffit pas si la tendance du slot est clairement contre
+    # ✅ v11.9g — Fix#1: votes<2 → gap doit être fort OU delta neutre
     if dir_votes < 2:
-        gap_is_strong = abs(spot_oracle_gap) >= ORACLE_GAP_MIN_STRONG  # gap fort = signal fiable seul
-        delta_is_neutral = abs(oracle_delta) < ORACLE_DELTA_CONTRA_MAX  # delta quasi-plat = pas de contre-signal
+        gap_is_strong = abs(spot_oracle_gap) >= ORACLE_GAP_MIN_STRONG
+        delta_is_neutral = abs(oracle_delta) < ORACLE_DELTA_CONTRA_MAX
         if not (gap_is_strong or delta_is_neutral):
             log_skip(
                 f"Oracle: votes={dir_votes}/3 gap={spot_oracle_gap:+.3f}% delta={oracle_delta:+.3f}% "
-                f"(gap pas assez fort ET delta contre trop fort)", direction,
+                f"(gap pas fort ET delta contre trop fort)", direction,
                 features={"gap":spot_oracle_gap,"delta":oracle_delta,"ret3s":ret_3s,
                           "votes":dir_votes,"filter":"votes_delta"})
             return
@@ -2711,16 +2709,21 @@ async def job_oracle_lag(context):
                 log_skip(f"Oracle: DOWN bloqué — tendance 10min {ch10:+.2f}% (haussière)", direction, features={"gap":spot_oracle_gap,"delta":oracle_delta,"ret3s":ret_3s,"votes":dir_votes,"filter":"trend10","ch10":ch10})
                 return
 
-    # ✅ v10.36 FIX #3 — Return 3s doit confirmer le gap (min 1bps dans la bonne direction)
-    # Le gap spot↔oracle peut être un artefact si le spot lui-même repart en sens inverse
-    if primary_signal == "gap" and dir_votes < 3:
-        ret_ok = (direction == "UP" and ret_3s >= -ORACLE_GAP_CONFIRM_RET) or                  (direction == "DOWN" and ret_3s <= ORACLE_GAP_CONFIRM_RET)
-        if not ret_ok:
-            log_skip(
-                f"Oracle: gap {direction} mais ret_3s={ret_3s:+.3f}% confirme pas (seuil {ORACLE_GAP_CONFIRM_RET}%)",
-                direction, features={"gap":spot_oracle_gap,"delta":oracle_delta,"ret3s":ret_3s,
-                                     "votes":dir_votes,"filter":"ret3s"})
-            return
+    # ✅ v11.9g — Nouveau Fix#3: delta doit confirmer le gap (Haiku: ALL WIN delta≥+0.031%)
+    # ret3s supprimé (bruit identique WIN/LOSS). Nouveau check: si gap UP mais delta négatif → skip
+    DELTA_CONTRA_STRICT = 0.020  # Plus strict que Fix#1 pour bloquer les deltas moderément contre
+    if primary_signal == "gap" and direction == "UP" and oracle_delta < -DELTA_CONTRA_STRICT:
+        log_skip(
+            f"Oracle: gap UP mais delta {oracle_delta:+.3f}%<-{DELTA_CONTRA_STRICT}% (contra trop fort)",
+            direction, features={"gap":spot_oracle_gap,"delta":oracle_delta,"ret3s":ret_3s,
+                                  "votes":dir_votes,"filter":"delta_contra"})
+        return
+    if primary_signal == "gap" and direction == "DOWN" and oracle_delta > DELTA_CONTRA_STRICT:
+        log_skip(
+            f"Oracle: gap DOWN mais delta {oracle_delta:+.3f}%>+{DELTA_CONTRA_STRICT}% (contra trop fort)",
+            direction, features={"gap":spot_oracle_gap,"delta":oracle_delta,"ret3s":ret_3s,
+                                  "votes":dir_votes,"filter":"delta_contra"})
+        return
 
     # ── Récupérer le token ──
     if st.paper_mode:
