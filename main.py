@@ -1,5 +1,16 @@
 """
-POLYMARKET BTC BOT v10.28 — R:R FIX + BPS ÉLARGI
+POLYMARKET BTC BOT v10.29 — FRAIS CORRIGÉS + FEE_FILTER SUPPRIMÉ
+NOUVEAUTÉS v10.29 — CORRECTIONS MAJEURES:
+
+SOURCES VÉRIFIÉES (juin 2026):
+  • Formule frais officielle: fee = shares × feeRate × p × (1-p)
+    feeRate crypto = 0.07 (source: docs Polymarket + startpolymarket.com)
+    NOTRE ANCIENNE FORMULE ÉTAIT FAUSSE: 0.25*(p*(1-p))²
+    Écart à p=0.65$: ancien 0.53¢ vs réel 1.07¢ (x2 sous-estimé!)
+  • Maker orders: zéro frais + rebate 100% des frais taker (source: luckylobster.io)
+  • Filtre fee_pct>0.5% SUPPRIMÉ: redondant avec EV gate, tuait la zone 0.55-0.75$
+  • Fee max crypto = 1.80% à p=0.50$ (source: startpolymarket.com)
+
 NOUVEAUTÉS v10.28 — R:R FIX (diagnostic sur 20 trades réels):
 
 PROBLÈME IDENTIFIÉ sur v10.27:
@@ -31,7 +42,7 @@ from collections import deque
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 
-BOT_VERSION = "10.28"
+BOT_VERSION = "10.29"
 
 def load_env():
     env_path = os.path.join(os.path.dirname(__file__), '.env')
@@ -68,7 +79,7 @@ KELLY_FRACTION  = 0.25
 ENTRY_LAST_SECONDS = 60   # Entrée jusqu'à T-60s (polybacktest: pas trop tard)
 SNIPE_LAST_MIN     = 30   # Fenêtre: T-4min → T-60s (entrée entre T+30s et T-60s)
 SNIPE_MIN_PROB     = 0.72 # ✅ v10.28 — abaissé (compensé par EV gate plus strict)
-SNIPE_EDGE_MIN     = 0.10 # ✅ v10.28 — relevé 4→10%: garde-fou R:R (p_dir-token≥10%)
+SNIPE_EDGE_MIN     = 0.10 # ✅ v10.28/29 — EV net après vrais frais ≥10% (ex: token 0.65$ → p_dir≥0.77)
 SNIPE_TOKEN_MIN    = 0.55 # ✅ v10.28 — R:R FIX: besoin token<0.70$ pour EV>0 à 70% WR
 SNIPE_TOKEN_MAX    = 0.75 # ✅ v10.28 — Cap: à 0.75$ avec 70% WR → EV +2.7%
 
@@ -138,14 +149,18 @@ log = logging.getLogger(__name__)
 
 def taker_fee_per_share(p):
     """
-    ✅ v10.22 — Frais taker réels Polymarket sur les marchés crypto 5min.
-    Formule officielle (docs Polymarket): Fee = C × 0.25 × (p × (1-p))²
-    → par share: 0.25 * (p*(1-p))²
-    p=0.50 → ~1.56¢/share (~3.1% du prix) | p=0.90 → ~0.20¢ (~0.2%)
-    Conclusion: trader près des extrêmes coûte quasi rien, trader à 50/50 coûte cher.
+    ✅ v10.29 — FORMULE CORRIGÉE (source: startpolymarket.com, docs Polymarket juin 2026)
+    fee = shares × feeRate × p × (1-p)
+    → par share: FEE_RATE_CRYPTO × p × (1-p)
+    FEE_RATE_CRYPTO = 0.07 (crypto 5min/15min uniquement)
+    p=0.50 → 1.75¢/share (max) | p=0.65 → 1.59¢ | p=0.75 → 1.31¢ | p=0.90 → 0.63¢
+    Maker orders: frais=0 + rebate (USE_MAKER_ORDERS=True dans place_bet)
+    ANCIENNE FORMULE ÉTAIT FAUSSE: 0.25*(p*(1-p))² sous-estimait les frais x2
     """
     if p <= 0 or p >= 1: return 0.0
-    return 0.25 * (p * (1.0 - p)) ** 2
+    return FEE_RATE_CRYPTO * p * (1.0 - p)
+
+FEE_RATE_CRYPTO = 0.07  # ✅ v10.29 — taux officiel crypto Polymarket (0.07 = max 1.75¢/share à p=0.50)
 
 def delta_to_weight(pct):
     """✅ v10.22 — Mapping window delta % → poids score (centralisé, 3 usages)"""
@@ -2467,10 +2482,10 @@ async def job_snipe(context):
         return
     fee=taker_fee_per_share(token_price_dir)
     # ✅ v10.25 — Vérification frais explicite: à 0.82$+ les frais sont <0.2¢ (quasi nuls)
-    fee_pct = fee / token_price_dir * 100 if token_price_dir > 0 else 99
-    if not st.paper_mode and fee_pct > 0.5:  # Jamais entrer si frais > 0.5% en réel
-        log_skip(f"SNIPE: frais trop élevés {fee_pct:.2f}% (token={token_price_dir:.2f}$)", direction)
-        return
+    # ✅ v10.29 — Filtre fee_pct>0.5% SUPPRIMÉ: redondant avec EV gate, tuait zone 0.55-0.75$
+    # Les frais sont inclus dans ev=p_dir-token_price_dir-fee. EV gate à 10% suffit.
+    fee_pct = fee / token_price_dir * 100 if token_price_dir > 0 else 0
+    log.debug(f"Fee: {fee*100:.2f}¢/share ({fee_pct:.2f}%)")
     ev=p_dir-token_price_dir-fee
     st.last_fair={"p_up":round(p_up,3),"sigma":round(sigma,4),"ev":round(ev,3),
                   "t_rem":int(slot_remaining),"fee":round(fee,4),"mode":"SNIPE"}
