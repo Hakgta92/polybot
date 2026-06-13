@@ -1527,7 +1527,13 @@ class State:
             "daily_pause_until":self.daily_pause_until,"paper_mode":self.paper_mode,
             "skipped":self.skipped,"pass_reasons":self.pass_reasons[-50:],
             "calib_factor":self.calib_factor,"killed":self.killed,
-            "version":BOT_VERSION,"saved_at":int(time.time())}
+            "version":BOT_VERSION,"saved_at":int(time.time()),
+            "oracle_patterns":self.oracle_patterns[-200:],
+            "calibration_log":self.calibration_log[-20:],
+            "haiku_insights":self.haiku_insights[-20:],
+            "filter_ret3s":FILTER_RET3S,
+            "filter_delta_contra":FILTER_DELTA_CONTRA,
+            "filter_gap_strong":FILTER_GAP_STRONG}
         try:
             with open(DATA_FILE,"w") as f: json.dump(data,f,indent=2)
         except Exception as e: log.error(f"Save: {e}")
@@ -1555,6 +1561,14 @@ class State:
                     self.daily_pause_until=d.get("daily_pause_until",0)
                     self.paper_mode=d.get("paper_mode",PAPER_MODE)
                     self.skipped=d.get("skipped",0); self.pass_reasons=d.get("pass_reasons",[])
+                    self.oracle_patterns=d.get("oracle_patterns",[])
+                    self.calibration_log=d.get("calibration_log",[])
+                    self.haiku_insights=d.get("haiku_insights",[])
+                    # ✅ Restaurer les seuils auto-calibrés
+                    global FILTER_RET3S, FILTER_DELTA_CONTRA, FILTER_GAP_STRONG
+                    FILTER_RET3S=d.get("filter_ret3s", FILTER_RET3S)
+                    FILTER_DELTA_CONTRA=d.get("filter_delta_contra", FILTER_DELTA_CONTRA)
+                    FILTER_GAP_STRONG=d.get("filter_gap_strong", FILTER_GAP_STRONG)
                     self.calib_factor=d.get("calib_factor",1.0); self.killed=d.get("killed",False)
                     age=int((time.time()-d.get("saved_at",0))/60)
                     log.info(f"✅ State {filepath} ({age}min) BR:{self.bankroll:.2f}"); return
